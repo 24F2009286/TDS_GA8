@@ -50,7 +50,7 @@ def normalize_text(text: str) -> str:
     return re.sub(r'\s+', ' ', nfkc).strip()
 
 def extract_words(text: str) -> set:
-    # [^\W_]+ strictly extracts Unicode letters and numbers, excluding underscores and punctuation
+    # [^\W_]+ strictly extracts Unicode letters and numbers, excluding underscores
     return set(re.findall(r'[^\W_]+', text, flags=re.UNICODE))
 
 def jaccard(set1: set, set2: set) -> float:
@@ -59,19 +59,19 @@ def jaccard(set1: set, set2: set) -> float:
     return len(set1 & set2) / len(set1 | set2)
 
 def generate_compact_json(row: dict) -> bytes:
+    # Exact output key order required by the instructions
     ordered = {
         "id": row["id"],
-        "entity": row["entity"],
-        "eventTime": row["eventTime"],
+        "entity": row["_norm_entity"],
+        "eventTime": row["_norm_time"],
         "revision": row["revision"],
-        "text": row["text"]
+        "text": row["_norm_text"]
     }
     return json.dumps(ordered, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
 
 @app.post("/build-corpus")
 @app.post("/build-corpus/")
 async def build_corpus(request: Request):
-    # Raw byte parsing to prevent FastAPI from throwing 422 on bad JSON bodies
     try:
         body_bytes = await request.body()
         payload = json.loads(body_bytes)
@@ -91,20 +91,20 @@ async def build_corpus(request: Request):
             policy_valid = True
 
     objects = payload["objects"]
-    rejected_objects = {}
-    rejected_rows = {}
+    rejected_objects_list = []
     valid_rows = []
     lineage = []
 
     # 1. Object Identity and Integrity Pipeline
     for obj in objects:
-        if type(obj) is not dict: continue
-        
+        if type(obj) is not dict:
+            obj = {}
+            
         uri = obj.get("uri")
         obj_reasons = set()
         uri_val = uri if type(uri) is str else None
 
-        if type(uri) is not str or not re.match(r'^gs://[^/]+/.+$', uri):
+        if type(uri) is not str or not re.fullmatch(r'^gs://[^/]+/.+$', uri):
             obj_reasons.add("URI_INVALID")
             
         gen = obj.get("generation")
@@ -126,12 +126,15 @@ async def build_corpus(request: Request):
         content = obj.get("content")
         schema = obj.get("schemaId")
         
-        if schema != "training-v1":
-            obj_reasons.add("SCHEMA_INVALID")
-            
+        has_schema_error = False
+        has_jsonl_error = False
         parsed_rows = []
+
+        if schema != "training-v1":
+            has_schema_error = True
+            
         if type(content) is not str:
-            obj_reasons.add("SCHEMA_INVALID")
+            has_schema_error = True
         else:
             if crc_valid:
                 calculated_crc = compute_crc32c(content.encode('utf-8'))
@@ -141,10 +144,7 @@ async def build_corpus(request: Request):
             lines = content.split('\n')
             non_blank_lines = [l for l in lines if l.strip()]
             if not non_blank_lines:
-                obj_reasons.add("SCHEMA_INVALID")
-            
-            has_jsonl_error = False
-            has_schema_error = False
+                has_schema_error = True
             
             for line in non_blank_lines:
                 try:
@@ -169,17 +169,22 @@ async def build_corpus(request: Request):
                         continue
                         
                     row["_parsed_dt"] = dt 
+                    row["reasonCodes"] = set()
                     parsed_rows.append(row)
                 except Exception:
                     has_jsonl_error = True
 
-            if has_jsonl_error:
-                obj_reasons.add("JSONL_INVALID")
-            if has_schema_error:
-                obj_reasons.add("SCHEMA_INVALID")
+        if has_jsonl_error:
+            obj_reasons.add("JSONL_INVALID")
+        if has_schema_error:
+            obj_reasons.add("SCHEMA_INVALID")
 
+        # Object Disposition
         if obj_reasons:
-            rejected_objects[uri_val] = obj_reasons
+            rejected_objects_list.append({
+                "uri": uri_val,
+                "reasonCodes": sorted(list(obj_reasons))
+            })
         else:
             lineage.append({
                 "uri": uri,
@@ -190,7 +195,7 @@ async def build_corpus(request: Request):
             for r in parsed_rows:
                 valid_rows.append(r)
 
-    # 2. Canonicalization and Deduplication
+    # 2. Canonicalization and Deduplication Pipeline
     dedup_map = {}
     for row in valid_rows:
         dt = row["_parsed_dt"]
@@ -198,88 +203,85 @@ async def build_corpus(request: Request):
         norm_entity = normalize_text(row["entity"])
         norm_text = normalize_text(row["text"])
         
+        row["_norm_time"] = norm_time
+        row["_norm_entity"] = norm_entity
+        row["_norm_text"] = norm_text
+        row["_raw_id_bytes"] = row["id"].encode('utf-8')
+        row["_words"] = extract_words(norm_text)
+        
         tup = (norm_entity, norm_time, norm_text)
-        candidate = {
-            "id": row["id"],
-            "entity": norm_entity,
-            "eventTime": norm_time,
-            "revision": row["revision"],
-            "text": norm_text,
-            "dt": dt,
-            "raw_id_bytes": row["id"].encode('utf-8')
-        }
 
         if tup not in dedup_map:
-            dedup_map[tup] = candidate
+            dedup_map[tup] = row
         else:
             existing = dedup_map[tup]
-            if candidate["revision"] > existing["revision"] or \
-               (candidate["revision"] == existing["revision"] and candidate["raw_id_bytes"] < existing["raw_id_bytes"]):
-                if existing["id"] not in rejected_rows: rejected_rows[existing["id"]] = set()
-                rejected_rows[existing["id"]].add("DUPLICATE")
-                dedup_map[tup] = candidate
+            if row["revision"] > existing["revision"] or \
+               (row["revision"] == existing["revision"] and row["_raw_id_bytes"] < existing["_raw_id_bytes"]):
+                existing["reasonCodes"].add("DUPLICATE")
+                dedup_map[tup] = row
             else:
-                if candidate["id"] not in rejected_rows: rejected_rows[candidate["id"]] = set()
-                rejected_rows[candidate["id"]].add("DUPLICATE")
+                row["reasonCodes"].add("DUPLICATE")
 
-    # 3. Policy Window Check
-    retained = list(dedup_map.values())
-    if not policy_valid:
-        for r in retained:
-            if r["id"] not in rejected_rows: rejected_rows[r["id"]] = set()
-            rejected_rows[r["id"]].add("POLICY_INVALID")
-        retained = []
-    else:
-        window_retained = []
-        for r in retained:
-            if policy_min <= r["dt"] <= policy_max:
-                window_retained.append(r)
+    # 3. Policy Window Check (Applied only to retained deduplication winners)
+    retained_rows = list(dedup_map.values())
+    window_survivors = []
+    
+    for row in retained_rows:
+        if not policy_valid:
+            row["reasonCodes"].add("POLICY_INVALID")
+        else:
+            if policy_min <= row["_parsed_dt"] <= policy_max:
+                window_survivors.append(row)
             else:
-                if r["id"] not in rejected_rows: rejected_rows[r["id"]] = set()
-                rejected_rows[r["id"]].add("OUT_OF_WINDOW")
-        retained = window_retained
+                row["reasonCodes"].add("OUT_OF_WINDOW")
 
     # 4. Routing and Contamination Check
     train_pool = []
     val_test_pool = []
 
-    for r in retained:
-        entity_bytes = r["entity"].encode('utf-8')
+    for row in window_survivors:
+        entity_bytes = row["_norm_entity"].encode('utf-8')
         first_byte = hashlib.sha256(entity_bytes).digest()[0]
         bucket = first_byte % 10
-        r["words"] = extract_words(r["text"])
         
         if 0 <= bucket <= 5:
-            r["split"] = "train"
-            train_pool.append(r)
+            row["_split"] = "train"
+            train_pool.append(row)
         elif 6 <= bucket <= 7:
-            r["split"] = "validation"
-            val_test_pool.append(r)
+            row["_split"] = "validation"
+            val_test_pool.append(row)
         else:
-            r["split"] = "test"
-            val_test_pool.append(r)
+            row["_split"] = "test"
+            val_test_pool.append(row)
 
     splits = {"train": train_pool, "validation": [], "test": []}
         
-    for r in val_test_pool:
+    for row in val_test_pool:
         contaminated = False
         for tr in train_pool:
-            if jaccard(r["words"], tr["words"]) >= thresh:
+            if jaccard(row["_words"], tr["_words"]) >= thresh:
                 contaminated = True
                 break
         
         if contaminated:
-            if r["id"] not in rejected_rows: rejected_rows[r["id"]] = set()
-            rejected_rows[r["id"]].add("TRAIN_CONTAMINATION")
+            row["reasonCodes"].add("TRAIN_CONTAMINATION")
         else:
-            splits[r["split"]].append(r)
+            splits[row["_split"]].append(row)
 
-    # 5. Serialization and Hashing
+    # 5. Build Final Data Structures
+    rejected_rows_list = []
+    for row in valid_rows:
+        if row["reasonCodes"]:
+            rejected_rows_list.append({
+                "id": row["id"],
+                "reasonCodes": sorted(list(row["reasonCodes"]))
+            })
+
     formatted_splits = {"train": [], "validation": [], "test": []}
     digests = {"train": "", "validation": "", "test": ""}
 
     for k in splits:
-        splits[k].sort(key=lambda x: (x["raw_id_bytes"], generate_compact_json(x)))
+        splits[k].sort(key=lambda x: (x["_raw_id_bytes"], generate_compact_json(x)))
         raw_bytes = b""
         for r in splits[k]:
             compact = generate_compact_json(r)
@@ -287,19 +289,15 @@ async def build_corpus(request: Request):
             raw_bytes += compact + b"\n"
         digests[k] = hashlib.sha256(raw_bytes).hexdigest()
 
-    # 6. Sorting exact output structures
-    rej_objs_list = [{"uri": k, "reasonCodes": sorted(list(v))} for k, v in rejected_objects.items()]
-    rej_objs_list.sort(key=lambda x: (x["uri"].encode('utf-8') if x["uri"] else b"", json.dumps(x, separators=(',', ':')).encode('utf-8')))
-    
-    rej_rows_list = [{"id": k, "reasonCodes": sorted(list(v))} for k, v in rejected_rows.items()]
-    rej_rows_list.sort(key=lambda x: (x["id"].encode('utf-8'), json.dumps(x, separators=(',', ':')).encode('utf-8')))
-
+    # 6. Strict Sorting for Deterministic Output
+    rejected_objects_list.sort(key=lambda x: (x["uri"].encode('utf-8') if type(x["uri"]) is str else b"", json.dumps(x, separators=(',', ':')).encode('utf-8')))
+    rejected_rows_list.sort(key=lambda x: (x["id"].encode('utf-8'), json.dumps(x, separators=(',', ':')).encode('utf-8')))
     lineage.sort(key=lambda x: (x["uri"].encode('utf-8'), json.dumps(x, separators=(',', ':')).encode('utf-8')))
 
     response_payload = {
         "splits": formatted_splits,
-        "rejectedObjects": rej_objs_list,
-        "rejectedRows": rej_rows_list,
+        "rejectedObjects": rejected_objects_list,
+        "rejectedRows": rejected_rows_list,
         "digests": digests,
         "lineage": lineage
     }
