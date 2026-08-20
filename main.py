@@ -7,7 +7,6 @@ from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
-# Precompute CRC32C table for pure-Python execution without C-extensions
 CRC32C_TABLE = [0] * 256
 for i in range(256):
     c = i
@@ -40,7 +39,6 @@ def parse_and_validate_time(ts: str):
         dt = datetime.strptime(base, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=tz)
         if frac:
             dt = dt.replace(microsecond=int(frac.ljust(6, '0')))
-        
         return dt.astimezone(timezone.utc)
     except ValueError:
         return None
@@ -67,6 +65,10 @@ def generate_compact_json(row: dict) -> bytes:
     }
     return json.dumps(ordered, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
 
+# --- FIX: Reject Python's loose JSON constants ---
+def _reject_constant(_s):
+    raise ValueError("non-JSON constant")
+
 @app.post("/build-corpus")
 @app.post("/build-corpus/")
 async def build_corpus(request: Request):
@@ -76,7 +78,6 @@ async def build_corpus(request: Request):
     except Exception:
         return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
         
-    # Strictly trap null policies and non-arrays to satisfy 400 Bad Request limits
     if type(payload) is not dict or payload.get("policy") is None or type(payload.get("objects")) is not list:
         return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
 
@@ -94,7 +95,6 @@ async def build_corpus(request: Request):
     valid_rows = []
     lineage = []
 
-    # 1. Object Identity and Integrity Pipeline
     for obj in objects:
         if type(obj) is not dict:
             obj = {}
@@ -103,7 +103,6 @@ async def build_corpus(request: Request):
         obj_reasons = set()
         uri_val = uri if type(uri) is str else None
 
-        # re.DOTALL ensures malicious internal newlines in the object name still match the valid URI schema
         if type(uri) is not str or not re.fullmatch(r'^gs://[^/]+/.+$', uri, flags=re.DOTALL):
             obj_reasons.add("URI_INVALID")
             
@@ -116,9 +115,9 @@ async def build_corpus(request: Request):
         if not gen_valid or not f_gen_valid:
             obj_reasons.add("GENERATION_INVALID")
             
-        if "generation" in obj and "fetchedGeneration" in obj:
-            if gen != f_gen:
-                obj_reasons.add("GENERATION_MISMATCH")
+        # --- FIX: Evaluate mismatch unconditionally ---
+        if gen != f_gen:
+            obj_reasons.add("GENERATION_MISMATCH")
 
         crc = obj.get("crc32c")
         crc_valid = type(crc) is str and re.fullmatch(r'^[0-9a-f]{8}$', crc)
@@ -150,7 +149,8 @@ async def build_corpus(request: Request):
             
             for line in non_blank_lines:
                 try:
-                    row = json.loads(line)
+                    # --- FIX: Use strict parsing ---
+                    row = json.loads(line, parse_constant=_reject_constant)
                     if type(row) is not dict:
                         has_schema_error = True
                         continue
@@ -196,7 +196,6 @@ async def build_corpus(request: Request):
             for r in parsed_rows:
                 valid_rows.append(r)
 
-    # 2. Canonicalization and Deduplication Pipeline
     dedup_map = {}
     for row in valid_rows:
         dt = row["_parsed_dt"]
@@ -223,7 +222,6 @@ async def build_corpus(request: Request):
             else:
                 row["reasonCodes"].add("DUPLICATE")
 
-    # 3. Policy Window Check
     retained_rows = list(dedup_map.values())
     window_survivors = []
     
@@ -236,7 +234,6 @@ async def build_corpus(request: Request):
             else:
                 row["reasonCodes"].add("OUT_OF_WINDOW")
 
-    # 4. Routing and Contamination Check
     train_pool = []
     val_test_pool = []
 
@@ -269,7 +266,6 @@ async def build_corpus(request: Request):
         else:
             splits[row["_split"]].append(row)
 
-    # 5. Build Final Data Structures
     rejected_rows_list = []
     for row in valid_rows:
         if row["reasonCodes"]:
