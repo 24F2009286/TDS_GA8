@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
+# Precompute CRC32C table for pure-Python execution without C-extensions
 CRC32C_TABLE = [0] * 256
 for i in range(256):
     c = i
@@ -65,7 +66,6 @@ def generate_compact_json(row: dict) -> bytes:
     }
     return json.dumps(ordered, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
 
-# --- FIX: Reject Python's loose JSON constants ---
 def _reject_constant(_s):
     raise ValueError("non-JSON constant")
 
@@ -92,9 +92,13 @@ async def build_corpus(request: Request):
 
     objects = payload["objects"]
     rejected_objects_list = []
+    rejected_rows_list = []
     valid_rows = []
     lineage = []
+    
+    global_order = 0
 
+    # 1. Object Identity and Integrity Pipeline
     for obj in objects:
         if type(obj) is not dict:
             obj = {}
@@ -115,7 +119,7 @@ async def build_corpus(request: Request):
         if not gen_valid or not f_gen_valid:
             obj_reasons.add("GENERATION_INVALID")
             
-        # --- FIX: Evaluate mismatch unconditionally ---
+        # Unconditional mismatch check
         if gen != f_gen:
             obj_reasons.add("GENERATION_MISMATCH")
 
@@ -143,13 +147,16 @@ async def build_corpus(request: Request):
                     obj_reasons.add("CRC32C_MISMATCH")
 
             lines = content.split('\n')
+            
+            # Handle trailing carriage returns like the reference code
+            lines = [l[:-1] if l.endswith('\r') else l for l in lines]
             non_blank_lines = [l for l in lines if l.strip()]
+            
             if not non_blank_lines:
                 has_schema_error = True
             
             for line in non_blank_lines:
                 try:
-                    # --- FIX: Use strict parsing ---
                     row = json.loads(line, parse_constant=_reject_constant)
                     if type(row) is not dict:
                         has_schema_error = True
@@ -171,7 +178,8 @@ async def build_corpus(request: Request):
                         continue
                         
                     row["_parsed_dt"] = dt 
-                    row["reasonCodes"] = set()
+                    row["_order"] = global_order
+                    global_order += 1
                     parsed_rows.append(row)
                 except Exception:
                     has_jsonl_error = True
@@ -196,7 +204,8 @@ async def build_corpus(request: Request):
             for r in parsed_rows:
                 valid_rows.append(r)
 
-    dedup_map = {}
+    # 2. Canonicalization and Deduplication Pipeline
+    groups = {}
     for row in valid_rows:
         dt = row["_parsed_dt"]
         norm_time = dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -210,30 +219,44 @@ async def build_corpus(request: Request):
         row["_words"] = extract_words(norm_text)
         
         tup = (norm_entity, norm_time, norm_text)
+        if tup not in groups:
+            groups[tup] = []
+        groups[tup].append(row)
 
-        if tup not in dedup_map:
-            dedup_map[tup] = row
-        else:
-            existing = dedup_map[tup]
-            if row["revision"] > existing["revision"] or \
-               (row["revision"] == existing["revision"] and row["_raw_id_bytes"] < existing["_raw_id_bytes"]):
-                existing["reasonCodes"].add("DUPLICATE")
-                dedup_map[tup] = row
-            else:
-                row["reasonCodes"].add("DUPLICATE")
+    retained_rows = []
+    for key, members in groups.items():
+        # Break ties exactly like the reference: Revision (desc), ID bytes (asc), Order (asc)
+        members_sorted = sorted(members, key=lambda r: (-r["revision"], r["_raw_id_bytes"], r["_order"]))
+        retained_rows.append(members_sorted[0])
+        
+        for loser in members_sorted[1:]:
+            rejected_rows_list.append({
+                "id": loser["id"],
+                "reasonCodes": ["DUPLICATE"]
+            })
 
-    retained_rows = list(dedup_map.values())
+    # Restore ingestion order for deterministic routing
+    retained_rows.sort(key=lambda r: r["_order"])
+
+    # 3. Policy Window Check
     window_survivors = []
-    
-    for row in retained_rows:
-        if not policy_valid:
-            row["reasonCodes"].add("POLICY_INVALID")
-        else:
+    if not policy_valid:
+        for row in retained_rows:
+            rejected_rows_list.append({
+                "id": row["id"],
+                "reasonCodes": ["POLICY_INVALID"]
+            })
+    else:
+        for row in retained_rows:
             if policy_min <= row["_parsed_dt"] <= policy_max:
                 window_survivors.append(row)
             else:
-                row["reasonCodes"].add("OUT_OF_WINDOW")
+                rejected_rows_list.append({
+                    "id": row["id"],
+                    "reasonCodes": ["OUT_OF_WINDOW"]
+                })
 
+    # 4. Routing and Contamination Check
     train_pool = []
     val_test_pool = []
 
@@ -262,18 +285,14 @@ async def build_corpus(request: Request):
                 break
         
         if contaminated:
-            row["reasonCodes"].add("TRAIN_CONTAMINATION")
+            rejected_rows_list.append({
+                "id": row["id"],
+                "reasonCodes": ["TRAIN_CONTAMINATION"]
+            })
         else:
             splits[row["_split"]].append(row)
 
-    rejected_rows_list = []
-    for row in valid_rows:
-        if row["reasonCodes"]:
-            rejected_rows_list.append({
-                "id": row["id"],
-                "reasonCodes": sorted(list(row["reasonCodes"]), key=lambda x: x.encode('utf-8'))
-            })
-
+    # 5. Build Final Data Structures
     formatted_splits = {"train": [], "validation": [], "test": []}
     digests = {"train": "", "validation": "", "test": ""}
 
