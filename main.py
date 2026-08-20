@@ -250,9 +250,13 @@ async def build_corpus(request: Request):
         fetched_valid = isinstance(fetched_generation, str) and GENERATION_RE.match(
             fetched_generation
         )
+        # GENERATION_INVALID and GENERATION_MISMATCH are independent checks
+        # (spec: "Emit every independently applicable object code"), so both
+        # can fire on the same object -- e.g. generation="abc",
+        # fetchedGeneration="5" is both non-decimal AND unequal.
         if not gen_valid or not fetched_valid:
             codes.add("GENERATION_INVALID")
-        elif generation != fetched_generation:
+        if generation != fetched_generation:
             codes.add("GENERATION_MISMATCH")
 
         crc_syntax_ok = isinstance(crc, str) and CRC_RE.match(crc)
