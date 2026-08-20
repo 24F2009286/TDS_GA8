@@ -4,10 +4,10 @@ import re
 import unicodedata
 import hashlib
 from datetime import datetime, timezone, timedelta
+import sys
 
 app = FastAPI()
 
-# Precompute CRC32C table for pure-Python execution without C-extensions
 CRC32C_TABLE = [0] * 256
 for i in range(256):
     c = i
@@ -23,7 +23,6 @@ def compute_crc32c(data: bytes) -> str:
 
 def parse_and_validate_time(ts: str):
     if type(ts) is not str: return None
-    # Strictly limit to ASCII digits [0-9] to prevent Unicode numeral bypasses
     match = re.fullmatch(r'^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,3}))?(Z|[+-][0-9]{2}:[0-9]{2})$', ts)
     if not match: return None
     
@@ -51,7 +50,6 @@ def normalize_text(text: str) -> str:
     return re.sub(r'\s+', ' ', nfkc).strip()
 
 def extract_words(text: str) -> set:
-    # [^\W_]+ strictly extracts Unicode letters and numbers, excluding underscores
     return set(re.findall(r'[^\W_]+', text, flags=re.UNICODE))
 
 def jaccard(set1: set, set2: set) -> float:
@@ -60,7 +58,6 @@ def jaccard(set1: set, set2: set) -> float:
     return len(set1 & set2) / len(set1 | set2)
 
 def generate_compact_json(row: dict) -> bytes:
-    # Exact output key order required by the instructions
     ordered = {
         "id": row["id"],
         "entity": row["_norm_entity"],
@@ -73,13 +70,19 @@ def generate_compact_json(row: dict) -> bytes:
 @app.post("/build-corpus")
 @app.post("/build-corpus/")
 async def build_corpus(request: Request):
+    print("\n" + "="*50, flush=True)
+    print(f"[DEBUG] NEW REQUEST RECEIVED", flush=True)
+    
     try:
         body_bytes = await request.body()
+        print(f"[DEBUG] RAW BODY (first 500 chars): {body_bytes[:500]}", flush=True)
         payload = json.loads(body_bytes)
-    except Exception:
+    except Exception as e:
+        print(f"[DEBUG] JSON PARSE ERROR: {e}", flush=True)
         return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
         
     if type(payload) is not dict or "policy" not in payload or type(payload.get("objects")) is not list:
+        print(f"[DEBUG] INVALID PAYLOAD SHAPE. Type: {type(payload)}, Has policy: {'policy' in payload if type(payload) is dict else False}, Objects type: {type(payload.get('objects')) if type(payload) is dict else None}", flush=True)
         return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
 
     policy = payload["policy"]
@@ -91,13 +94,14 @@ async def build_corpus(request: Request):
         if policy_min and policy_max and type(thresh) in (int, float) and not type(thresh) is bool and 0.0 <= thresh <= 1.0:
             policy_valid = True
 
+    print(f"[DEBUG] POLICY VALID: {policy_valid}", flush=True)
+
     objects = payload["objects"]
     rejected_objects_list = []
     valid_rows = []
     lineage = []
 
-    # 1. Object Identity and Integrity Pipeline
-    for obj in objects:
+    for idx, obj in enumerate(objects):
         if type(obj) is not dict:
             obj = {}
             
@@ -111,14 +115,12 @@ async def build_corpus(request: Request):
         gen = obj.get("generation")
         f_gen = obj.get("fetchedGeneration")
         
-        # Strictly enforce standard ASCII decimal integers to prevent Unicode bypass
         gen_valid = type(gen) is str and re.fullmatch(r'^[0-9]+$', gen) is not None
         f_gen_valid = type(f_gen) is str and re.fullmatch(r'^[0-9]+$', f_gen) is not None
         
         if not gen_valid or not f_gen_valid:
             obj_reasons.add("GENERATION_INVALID")
             
-        # Only evaluate mismatch if both are supplied
         if "generation" in obj and "fetchedGeneration" in obj:
             if gen != f_gen:
                 obj_reasons.add("GENERATION_MISMATCH")
@@ -184,14 +186,14 @@ async def build_corpus(request: Request):
         if has_schema_error:
             obj_reasons.add("SCHEMA_INVALID")
 
-        # Object Disposition
         if obj_reasons:
+            print(f"[DEBUG] OBJ {idx} REJECTED | URI: {uri_val} | REASONS: {obj_reasons}", flush=True)
             rejected_objects_list.append({
                 "uri": uri_val,
-                # Explicitly sort reason codes by UTF-8 bytes to satisfy the strict grader rule
                 "reasonCodes": sorted(list(obj_reasons), key=lambda x: x.encode('utf-8'))
             })
         else:
+            print(f"[DEBUG] OBJ {idx} ACCEPTED | URI: {uri_val}", flush=True)
             lineage.append({
                 "uri": uri,
                 "generation": gen,
@@ -228,7 +230,7 @@ async def build_corpus(request: Request):
             else:
                 row["reasonCodes"].add("DUPLICATE")
 
-    # 3. Policy Window Check (Applied only to retained deduplication winners)
+    # 3. Policy Window Check
     retained_rows = list(dedup_map.values())
     window_survivors = []
     
@@ -295,7 +297,6 @@ async def build_corpus(request: Request):
             raw_bytes += compact + b"\n"
         digests[k] = hashlib.sha256(raw_bytes).hexdigest()
 
-    # 6. Strict Sorting for Deterministic Output
     rejected_objects_list.sort(key=lambda x: (x["uri"].encode('utf-8') if type(x["uri"]) is str else b"", json.dumps(x, separators=(',', ':')).encode('utf-8')))
     rejected_rows_list.sort(key=lambda x: (x["id"].encode('utf-8'), json.dumps(x, separators=(',', ':')).encode('utf-8')))
     lineage.sort(key=lambda x: (x["uri"].encode('utf-8'), json.dumps(x, separators=(',', ':')).encode('utf-8')))
@@ -308,4 +309,8 @@ async def build_corpus(request: Request):
         "lineage": lineage
     }
 
+    print(f"[DEBUG] REJECTED OBJECTS COUNT: {len(rejected_objects_list)}", flush=True)
+    print(f"[DEBUG] RESPONSE OK", flush=True)
+    print("="*50 + "\n", flush=True)
+    
     return Response(content=json.dumps(response_payload, ensure_ascii=False, separators=(',', ':')), status_code=200, media_type="application/json")
