@@ -4,10 +4,10 @@ import re
 import unicodedata
 import hashlib
 from datetime import datetime, timezone, timedelta
-import sys
 
 app = FastAPI()
 
+# Precompute CRC32C table for pure-Python execution without C-extensions
 CRC32C_TABLE = [0] * 256
 for i in range(256):
     c = i
@@ -70,19 +70,14 @@ def generate_compact_json(row: dict) -> bytes:
 @app.post("/build-corpus")
 @app.post("/build-corpus/")
 async def build_corpus(request: Request):
-    print("\n" + "="*50, flush=True)
-    print(f"[DEBUG] NEW REQUEST RECEIVED", flush=True)
-    
     try:
         body_bytes = await request.body()
-        print(f"[DEBUG] RAW BODY (first 500 chars): {body_bytes[:500]}", flush=True)
         payload = json.loads(body_bytes)
-    except Exception as e:
-        print(f"[DEBUG] JSON PARSE ERROR: {e}", flush=True)
+    except Exception:
         return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
         
-    if type(payload) is not dict or "policy" not in payload or type(payload.get("objects")) is not list:
-        print(f"[DEBUG] INVALID PAYLOAD SHAPE. Type: {type(payload)}, Has policy: {'policy' in payload if type(payload) is dict else False}, Objects type: {type(payload.get('objects')) if type(payload) is dict else None}", flush=True)
+    # Strictly trap null policies and non-arrays to satisfy 400 Bad Request limits
+    if type(payload) is not dict or payload.get("policy") is None or type(payload.get("objects")) is not list:
         return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
 
     policy = payload["policy"]
@@ -94,14 +89,13 @@ async def build_corpus(request: Request):
         if policy_min and policy_max and type(thresh) in (int, float) and not type(thresh) is bool and 0.0 <= thresh <= 1.0:
             policy_valid = True
 
-    print(f"[DEBUG] POLICY VALID: {policy_valid}", flush=True)
-
     objects = payload["objects"]
     rejected_objects_list = []
     valid_rows = []
     lineage = []
 
-    for idx, obj in enumerate(objects):
+    # 1. Object Identity and Integrity Pipeline
+    for obj in objects:
         if type(obj) is not dict:
             obj = {}
             
@@ -109,7 +103,8 @@ async def build_corpus(request: Request):
         obj_reasons = set()
         uri_val = uri if type(uri) is str else None
 
-        if type(uri) is not str or not re.fullmatch(r'^gs://[^/]+/.+$', uri):
+        # re.DOTALL ensures malicious internal newlines in the object name still match the valid URI schema
+        if type(uri) is not str or not re.fullmatch(r'^gs://[^/]+/.+$', uri, flags=re.DOTALL):
             obj_reasons.add("URI_INVALID")
             
         gen = obj.get("generation")
@@ -187,13 +182,11 @@ async def build_corpus(request: Request):
             obj_reasons.add("SCHEMA_INVALID")
 
         if obj_reasons:
-            print(f"[DEBUG] OBJ {idx} REJECTED | URI: {uri_val} | REASONS: {obj_reasons}", flush=True)
             rejected_objects_list.append({
                 "uri": uri_val,
                 "reasonCodes": sorted(list(obj_reasons), key=lambda x: x.encode('utf-8'))
             })
         else:
-            print(f"[DEBUG] OBJ {idx} ACCEPTED | URI: {uri_val}", flush=True)
             lineage.append({
                 "uri": uri,
                 "generation": gen,
@@ -309,8 +302,4 @@ async def build_corpus(request: Request):
         "lineage": lineage
     }
 
-    print(f"[DEBUG] REJECTED OBJECTS COUNT: {len(rejected_objects_list)}", flush=True)
-    print(f"[DEBUG] RESPONSE OK", flush=True)
-    print("="*50 + "\n", flush=True)
-    
     return Response(content=json.dumps(response_payload, ensure_ascii=False, separators=(',', ':')), status_code=200, media_type="application/json")
