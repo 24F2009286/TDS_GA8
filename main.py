@@ -1,578 +1,338 @@
-"""
-Immutable, Leakage-Safe Training Corpus builder.
-
-POST /build-corpus
-
-See the assignment spec for exact behavior. Key design decisions /
-assumptions made where the spec is ambiguous are marked with `# ASSUMPTION:`.
-
-DEBUGGING:
-  - Every request logs a structured JSON trace to stdout (visible in Render
-    logs) showing per-object codes, per-row canonicalization, dedup,
-    window, split-bucket, and contamination decisions.
-  - Add "?debug=1" to the URL to also get that trace back in the HTTP
-    response under a "_debug" key. The grader will never pass this
-    query param, so it never affects grading, but you can hit the live
-    endpoint yourself and see exactly what happened to each row.
-"""
-
-import hashlib
+from fastapi import FastAPI, Request, Response
 import json
-import logging
-import math
 import re
-import sys
-import unicodedata
-from datetime import datetime, timedelta, timezone
-from typing import Any
-
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+import math
+from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
-logger = logging.getLogger("corpus")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    _h = logging.StreamHandler(sys.stdout)
-    _h.setFormatter(logging.Formatter("%(message)s"))
-    logger.addHandler(_h)
+# In-memory state store: runId -> {"request": original_payload, "response": response_payload}
+_STATE = {}
 
-# ---------------------------------------------------------------------------
-# Timestamp handling
-# ---------------------------------------------------------------------------
-
-TS_RE = re.compile(
-    r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})"
-    r"(?:\.(\d{1,3}))?"
-    r"(Z|[+-]\d{2}:\d{2})$"
-)
-
-
-def parse_timestamp(s: str):
-    """Return an aware UTC datetime, or None if invalid per spec."""
-    if not isinstance(s, str):
-        return None
-    m = TS_RE.match(s)
-    if not m:
-        return None
-    year, month, day, hour, minute, second, frac, tz = m.groups()
-    year, month, day = int(year), int(month), int(day)
-    hour, minute, second = int(hour), int(minute), int(second)
-
-    if not (1 <= month <= 12):
-        return None
+def parse_and_validate_time(ts: str):
+    if type(ts) is not str: return None
+    match = re.fullmatch(r'^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,3}))?(Z|[+-][0-9]{2}:[0-9]{2})$', ts)
+    if not match: return None
+    base, frac, offset_str = match.groups()
     try:
-        naive = datetime(year, month, day, hour, minute, second)
+        if offset_str == 'Z':
+            tz = timezone.utc
+        else:
+            sign = 1 if offset_str[0] == '+' else -1
+            hrs, mins = map(int, offset_str[1:].split(':'))
+            if hrs > 14 or (hrs == 14 and mins != 0) or mins > 59: return None
+            tz = timezone(timedelta(hours=sign*hrs, minutes=sign*mins))
+        dt = datetime.strptime(base, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=tz)
+        if frac: dt = dt.replace(microsecond=int(frac.ljust(6, '0')))
+        return dt.astimezone(timezone.utc)
     except ValueError:
         return None
-    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
-        return None
 
-    ms = 0
-    if frac:
-        ms = int(frac.ljust(3, "0")[:3])
+import hashlib
 
-    if tz == "Z":
-        offset_minutes = 0
-    else:
-        sign = 1 if tz[0] == "+" else -1
-        oh, om = int(tz[1:3]), int(tz[4:6])
-        if oh > 14 or om > 59:
-            return None
-        if oh == 14 and om != 0:
-            return None
-        offset_minutes = sign * (oh * 60 + om)
+def sha256_compact(data: dict) -> str:
+    compact_str = json.dumps(data, separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(compact_str.encode('utf-8')).hexdigest()
 
-    naive = naive.replace(microsecond=ms * 1000)
-    utc_dt = naive - timedelta(minutes=offset_minutes)
-    return utc_dt.replace(tzinfo=timezone.utc)
+def handle_select(payload: dict):
+    run_id = payload.get("runId")
+    if type(run_id) is not str or not run_id or len(run_id) > 128:
+        return None, ["INVALID_INPUT"]
+    
+    # Check idempotency / conflicts
+    if run_id in _STATE:
+        if _STATE[run_id]["request"] == payload:
+            return _STATE[run_id]["response"], None
+        else:
+            return "CONFLICT", None
 
+    limit = payload.get("numTrialsLimit")
+    if type(limit) is not int or limit <= 0: return None, ["INVALID_INPUT"]
 
-def format_utc(dt: datetime) -> str:
-    ms = dt.microsecond // 1000
-    return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{ms:03d}Z"
+    rows = payload.get("rows")
+    trials = payload.get("trials")
+    if type(rows) is not list or not rows or type(trials) is not list:
+        return None, ["INVALID_INPUT"]
 
+    # 1. Deduplicate Rows
+    groups = {}
+    for r in rows:
+        if type(r) is not dict: return None, ["INVALID_INPUT"]
+        r_id = r.get("id")
+        ent = r.get("entity")
+        evt = r.get("eventTime")
+        pt = r.get("predictionTime")
+        ver = r.get("version")
+        split = r.get("split")
+        feats = r.get("features")
+        
+        if not all(type(x) is str for x in [r_id, ent, evt, pt, split]): return None, ["INVALID_INPUT"]
+        if type(ver) is not int or ver < 0: return None, ["INVALID_INPUT"]
+        if split not in ("TRAIN", "EVAL"): return None, ["INVALID_INPUT"]
+        if type(feats) is not dict: return None, ["INVALID_INPUT"]
+        
+        evt_dt = parse_and_validate_time(evt)
+        pt_dt = parse_and_validate_time(pt)
+        if not evt_dt or not pt_dt: return None, ["INVALID_INPUT"]
+        
+        r["_evt_dt"] = evt_dt
+        r["_pt_dt"] = pt_dt
+        r["_id_bytes"] = r_id.encode('utf-8')
+        
+        key = (ent, evt_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+        if key not in groups: groups[key] = []
+        groups[key].append(r)
 
-# ---------------------------------------------------------------------------
-# CRC32C (Castagnoli) - not the same as zlib.crc32
-# ---------------------------------------------------------------------------
+    retained = []
+    for key, members in groups.items():
+        members.sort(key=lambda x: (-x["version"], x["_id_bytes"]))
+        retained.append(members[0])
 
-_CRC32C_TABLE = None
+    if not retained: return None, ["INVALID_INPUT"]
 
+    # 2. Feature Eligibility
+    forbidden = set(payload.get("forbiddenFeatures", []))
+    feature_counts = {}
+    feature_valid = {}
+    
+    for r in retained:
+        for fname, fval in r["features"].items():
+            if fname in forbidden: continue
+            if type(fval) is not dict: return None, ["INVALID_INPUT"]
+            avail_dt = parse_and_validate_time(fval.get("availableAt", ""))
+            if not avail_dt: return None, ["INVALID_INPUT"]
+            
+            feature_counts[fname] = feature_counts.get(fname, 0) + 1
+            if fname not in feature_valid: feature_valid[fname] = True
+            if avail_dt > r["_pt_dt"]: feature_valid[fname] = False
 
-def _build_crc32c_table():
-    global _CRC32C_TABLE
-    poly = 0x82F63B78
-    table = []
-    for i in range(256):
-        c = i
-        for _ in range(8):
-            c = (poly ^ (c >> 1)) if (c & 1) else (c >> 1)
-        table.append(c)
-    _CRC32C_TABLE = table
+    valid_features = []
+    req_count = len(retained)
+    for fname, count in feature_counts.items():
+        if count == req_count and feature_valid[fname]:
+            valid_features.append(fname)
+            
+    valid_features.sort(key=lambda x: x.encode('utf-8'))
 
+    # 3. Trial Selection
+    if len(trials) > limit:
+        return None, ["TRIAL_LIMIT_EXCEEDED"]
+        
+    best_trial = None
+    for t in trials:
+        if type(t) is not dict: return None, ["INVALID_INPUT"]
+        t_id = t.get("trialId")
+        status = t.get("status")
+        metric = t.get("evalMetric")
+        
+        if type(t_id) is not int or t_id < 0: return None, ["INVALID_INPUT"]
+        if status not in ("SUCCEEDED", "FAILED"): return None, ["INVALID_INPUT"]
+        if type(metric) not in (float, int) or not math.isfinite(metric): return None, ["INVALID_INPUT"]
+        
+        if status == "SUCCEEDED":
+            if best_trial is None:
+                best_trial = {"id": t_id, "metric": metric}
+            else:
+                if metric > best_trial["metric"]:
+                    best_trial = {"id": t_id, "metric": metric}
+                elif metric == best_trial["metric"] and t_id < best_trial["id"]:
+                    best_trial = {"id": t_id, "metric": metric}
 
-def crc32c(data: bytes) -> int:
-    if _CRC32C_TABLE is None:
-        _build_crc32c_table()
-    crc = 0xFFFFFFFF
-    for b in data:
-        crc = _CRC32C_TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
-    return crc ^ 0xFFFFFFFF
+    if not best_trial:
+        return None, ["NO_SUCCESSFUL_TRIAL"]
 
+    # 4. Generate Output
+    train_ids = [r["id"] for r in retained if r["split"] == "TRAIN"]
+    eval_ids = [r["id"] for r in retained if r["split"] == "EVAL"]
+    train_ids.sort(key=lambda x: x.encode('utf-8'))
+    eval_ids.sort(key=lambda x: x.encode('utf-8'))
 
-def crc32c_hex(data: bytes) -> str:
-    return format(crc32c(data), "08x")
-
-
-CRC_RE = re.compile(r"^[0-9a-f]{8}$")
-GENERATION_RE = re.compile(r"^\d+$")
-URI_RE = re.compile(r"^gs://[^/]+/.+$")
-
-# ---------------------------------------------------------------------------
-# Canonicalization
-# ---------------------------------------------------------------------------
-
-WS_RE = re.compile(r"\s+", re.UNICODE)
-
-
-def canonicalize_text(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s)
-    s = s.lower()
-    s = s.strip()
-    s = WS_RE.sub(" ", s)
-    return s
-
-
-WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)  # unicode letters/numbers, no underscore
-
-
-def word_set(s: str) -> set:
-    return set(w.lower() for w in WORD_RE.findall(s))
-
-
-def jaccard(a: set, b: set) -> float:
-    if not a and not b:
-        return 1.0
-    union = a | b
-    if not union:
-        return 1.0
-    return len(a & b) / len(union)
-
-
-# ---------------------------------------------------------------------------
-# Row shape validation
-# ---------------------------------------------------------------------------
-
-ROW_KEYS = {"id", "entity", "eventTime", "revision", "text"}
-MAX_SAFE_INT = 2**53 - 1
-
-
-def row_shape_valid(row: Any) -> bool:
-    if not isinstance(row, dict):
-        return False
-    if set(row.keys()) != ROW_KEYS:
-        return False
-    if not isinstance(row["id"], str):
-        return False
-    if not isinstance(row["entity"], str):
-        return False
-    if not isinstance(row["eventTime"], str):
-        return False
-    if not isinstance(row["text"], str):
-        return False
-    rev = row["revision"]
-    if isinstance(rev, bool) or not isinstance(rev, int):
-        return False
-    if rev < 0 or rev > MAX_SAFE_INT:
-        return False
-    return True
-
-
-def compact_json(obj) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-
-
-def utf8_key(s: str) -> bytes:
-    return s.encode("utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Main endpoint
-# ---------------------------------------------------------------------------
-
-
-@app.post("/build-corpus")
-async def build_corpus(request: Request):
-    debug_mode = request.query_params.get("debug") in ("1", "true", "yes")
-    debug = {
-        "objects": [],
-        "rows_canonicalized": [],
-        "dedup": [],
-        "window": [],
-        "split": [],
-        "contamination": [],
+    digest_payload = {
+        "trainRowIds": train_ids,
+        "evalRowIds": eval_ids,
+        "featureNames": valid_features
     }
-
-    try:
-        body = await request.json()
-    except Exception as e:
-        logger.info(json.dumps({"event": "parse_error", "error": str(e)}))
-        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
-
-    if not isinstance(body, dict):
-        logger.info(json.dumps({"event": "body_not_object"}))
-        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
-
-    policy = body.get("policy")
-    objects = body.get("objects")
-
-    if not isinstance(policy, dict) or not isinstance(objects, list):
-        logger.info(json.dumps({
-            "event": "invalid_input",
-            "policy_type": type(policy).__name__,
-            "objects_type": type(objects).__name__,
-        }))
-        return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
-
-    # --- Policy validity -----------------------------------------------
-    min_time_raw = policy.get("minTime")
-    max_time_raw = policy.get("maxTime")
-    threshold = policy.get("contaminationThreshold")
-
-    min_dt = parse_timestamp(min_time_raw) if isinstance(min_time_raw, str) else None
-    max_dt = parse_timestamp(max_time_raw) if isinstance(max_time_raw, str) else None
-
-    threshold_valid = (
-        isinstance(threshold, (int, float))
-        and not isinstance(threshold, bool)
-        and math.isfinite(threshold)
-        and 0 <= threshold <= 1
-    )
-
-    policy_valid = (min_dt is not None) and (max_dt is not None) and threshold_valid
-
-    logger.info(json.dumps({
-        "event": "policy",
-        "minTime_raw": min_time_raw,
-        "minTime_parsed": format_utc(min_dt) if min_dt else None,
-        "maxTime_raw": max_time_raw,
-        "maxTime_parsed": format_utc(max_dt) if max_dt else None,
-        "threshold": threshold,
-        "threshold_valid": threshold_valid,
-        "policy_valid": policy_valid,
-    }))
-
-    # --- Per-object validation ------------------------------------------
-    rejected_objects = []
-    lineage = []
-    retained_rows = []
-
-    for obj in objects:
-        if not isinstance(obj, dict):
-            rejected_objects.append(
-                {"uri": None, "reasonCodes": sorted(["SCHEMA_INVALID"])}
-            )
-            debug["objects"].append({"uri": None, "codes": ["SCHEMA_INVALID"], "reason": "object_not_dict"})
-            continue
-
-        uri = obj.get("uri")
-        generation = obj.get("generation")
-        fetched_generation = obj.get("fetchedGeneration")
-        crc = obj.get("crc32c")
-        schema_id = obj.get("schemaId")
-        content = obj.get("content")
-
-        codes = set()
-
-        uri_out = uri if isinstance(uri, str) else None
-        if not isinstance(uri, str) or not URI_RE.match(uri):
-            codes.add("URI_INVALID")
-
-        gen_valid = isinstance(generation, str) and GENERATION_RE.match(generation)
-        fetched_valid = isinstance(fetched_generation, str) and GENERATION_RE.match(
-            fetched_generation
-        )
-        if not gen_valid or not fetched_valid:
-            codes.add("GENERATION_INVALID")
-        if generation != fetched_generation:
-            codes.add("GENERATION_MISMATCH")
-
-        crc_syntax_ok = isinstance(crc, str) and CRC_RE.match(crc)
-        crc_actual = None
-        if not crc_syntax_ok:
-            codes.add("CRC32C_INVALID")
-        elif isinstance(content, str):
-            crc_actual = crc32c_hex(content.encode("utf-8"))
-            if crc_actual != crc:
-                codes.add("CRC32C_MISMATCH")
-
-        content_is_str = isinstance(content, str)
-        schema_ok = content_is_str and schema_id == "training-v1"
-
-        parsed_rows = []
-        jsonl_invalid = False
-        schema_invalid_extra = False
-        row_shape_failures = []
-
-        if content_is_str:
-            lines = content.split("\n")
-            non_blank = [ln for ln in lines if ln.strip() != ""]
-            if len(non_blank) == 0:
-                schema_invalid_extra = True
-            for ln in non_blank:
-                try:
-                    row = json.loads(ln)
-                except Exception:
-                    jsonl_invalid = True
-                    continue
-                if not row_shape_valid(row):
-                    schema_invalid_extra = True
-                    row_shape_failures.append(row)
-                    continue
-                parsed_rows.append(row)
-        else:
-            schema_invalid_extra = True
-
-        if jsonl_invalid:
-            codes.add("JSONL_INVALID")
-        if not schema_ok or schema_invalid_extra:
-            codes.add("SCHEMA_INVALID")
-
-        debug["objects"].append({
-            "uri": uri_out,
-            "codes": sorted(codes),
-            "generation": generation,
-            "fetchedGeneration": fetched_generation,
-            "crc_supplied": crc,
-            "crc_actual": crc_actual,
-            "schemaId": schema_id,
-            "content_is_str": content_is_str,
-            "num_parsed_rows": len(parsed_rows),
-            "row_shape_failures": row_shape_failures[:5],
-        })
-
-        if codes:
-            rejected_objects.append(
-                {"uri": uri_out, "reasonCodes": sorted(codes)}
-            )
-            continue
-
-        lineage.append(
-            {
-                "uri": uri,
-                "generation": generation,
-                "crc32c": crc,
-                "schemaId": schema_id,
-            }
-        )
-        for row in parsed_rows:
-            retained_rows.append(dict(row))
-
-    logger.info(json.dumps({"event": "objects", "detail": debug["objects"]}, default=str))
-
-    # --- Canonicalization + eventTime parsing ----------------------------
-    working = []
-    rejected_rows = []
-
-    for row in retained_rows:
-        entity_c = canonicalize_text(row["entity"])
-        text_c = canonicalize_text(row["text"])
-        dt = parse_timestamp(row["eventTime"])
-        debug["rows_canonicalized"].append({
-            "id": row["id"],
-            "entity_raw": row["entity"],
-            "entity_canonical": entity_c,
-            "eventTime_raw": row["eventTime"],
-            "eventTime_parsed": format_utc(dt) if dt else None,
-            "text_raw": row["text"],
-            "text_canonical": text_c,
-            "revision": row["revision"],
-        })
-        if dt is None:
-            rejected_rows.append((row["id"], "OUT_OF_WINDOW"))
-            continue
-        working.append(
-            {
-                "id": row["id"],
-                "entity": entity_c,
-                "eventTime": format_utc(dt),
-                "eventTime_dt": dt,
-                "revision": row["revision"],
-                "text": text_c,
-            }
-        )
-
-    logger.info(json.dumps({"event": "canonicalized", "detail": debug["rows_canonicalized"]}, default=str))
-
-    # --- Deduplication -----------------------------------------------
-    groups: dict[tuple, list] = {}
-    for r in working:
-        key = (r["entity"], r["eventTime"], r["text"])
-        groups.setdefault(key, []).append(r)
-
-    survivors = []
-    for key, rows in groups.items():
-        if len(rows) == 1:
-            survivors.append(rows[0])
-            debug["dedup"].append({"group_key": key, "winner": rows[0]["id"], "losers": []})
-            continue
-        best_rev = max(r["revision"] for r in rows)
-        candidates = [r for r in rows if r["revision"] == best_rev]
-        candidates.sort(key=lambda r: utf8_key(r["id"]))
-        winner = candidates[0]
-        survivors.append(winner)
-        losers = []
-        for r in rows:
-            if r is not winner:
-                rejected_rows.append((r["id"], "DUPLICATE"))
-                losers.append(r["id"])
-        debug["dedup"].append({"group_key": key, "winner": winner["id"], "losers": losers})
-
-    logger.info(json.dumps({"event": "dedup", "detail": debug["dedup"]}, default=str))
-
-    # --- Policy / window -----------------------------------------------
-    windowed = []
-    if not policy_valid:
-        for r in survivors:
-            rejected_rows.append((r["id"], "POLICY_INVALID"))
-            debug["window"].append({"id": r["id"], "result": "POLICY_INVALID"})
-    else:
-        for r in survivors:
-            in_window = min_dt <= r["eventTime_dt"] <= max_dt
-            if in_window:
-                windowed.append(r)
-                debug["window"].append({"id": r["id"], "eventTime": r["eventTime"], "result": "IN_WINDOW"})
-            else:
-                rejected_rows.append((r["id"], "OUT_OF_WINDOW"))
-                debug["window"].append({"id": r["id"], "eventTime": r["eventTime"], "result": "OUT_OF_WINDOW"})
-
-    logger.info(json.dumps({"event": "window", "detail": debug["window"]}, default=str))
-
-    # --- Split assignment -----------------------------------------------
-    splits: dict[str, list] = {"train": [], "validation": [], "test": []}
-    for r in windowed:
-        digest = hashlib.sha256(r["entity"].encode("utf-8")).digest()
-        first_byte = digest[0]
-        bucket = first_byte % 10
-        if bucket <= 5:
-            split = "train"
-        elif bucket <= 7:
-            split = "validation"
-        else:
-            split = "test"
-        r["_split"] = split
-        splits[split].append(r)
-        debug["split"].append({
-            "id": r["id"],
-            "entity": r["entity"],
-            "sha256_hex": digest.hex(),
-            "first_byte": first_byte,
-            "bucket_mod10": bucket,
-            "split": split,
-        })
-
-    logger.info(json.dumps({"event": "split", "detail": debug["split"]}, default=str))
-
-    # --- Contamination check -----------------------------------------------
-    train_rows_for_debug = [(r["id"], word_set(r["text"])) for r in splits["train"]]
-
-    for split_name in ("validation", "test"):
-        keep = []
-        for r in splits[split_name]:
-            ws = word_set(r["text"])
-            best_score = -1.0
-            best_train_id = None
-            for tid, tws in train_rows_for_debug:
-                score = jaccard(ws, tws)
-                if score > best_score:
-                    best_score = score
-                    best_train_id = tid
-            contaminated = best_score >= threshold if train_rows_for_debug else False
-            debug["contamination"].append({
-                "id": r["id"],
-                "split": split_name,
-                "word_set_size": len(ws),
-                "best_score": best_score,
-                "best_train_match": best_train_id,
-                "threshold": threshold,
-                "contaminated": contaminated,
-            })
-            if contaminated:
-                rejected_rows.append((r["id"], "TRAIN_CONTAMINATION"))
-            else:
-                keep.append(r)
-        splits[split_name] = keep
-
-    logger.info(json.dumps({"event": "contamination", "detail": debug["contamination"]}, default=str))
-
-    # --- Serialize + hash each split -----------------------------------------------
-    def row_public(r):
-        return {
-            "id": r["id"],
-            "entity": r["entity"],
-            "eventTime": r["eventTime"],
-            "revision": r["revision"],
-            "text": r["text"],
-        }
-
-    out_splits = {}
-    digests = {}
-    for split_name in ("train", "validation", "test"):
-        rows = splits[split_name]
-        rows_sorted = sorted(
-            rows, key=lambda r: (utf8_key(r["id"]), compact_json(row_public(r)))
-        )
-        public_rows = [row_public(r) for r in rows_sorted]
-        out_splits[split_name] = public_rows
-
-        buf = bytearray()
-        for pr in public_rows:
-            line = compact_json(pr) + "\n"
-            buf.extend(line.encode("utf-8"))
-        digests[split_name] = hashlib.sha256(bytes(buf)).hexdigest()
-
-    # --- Assemble rejected rows / objects / lineage -----------------------------------------------
-    row_reason_map: dict[str, set] = {}
-    for rid, code in rejected_rows:
-        row_reason_map.setdefault(rid, set()).add(code)
-
-    rejected_rows_out = [
-        {"id": rid, "reasonCodes": sorted(codes)}
-        for rid, codes in row_reason_map.items()
-    ]
-    rejected_rows_out.sort(key=lambda r: (utf8_key(r["id"]), compact_json(r)))
-
-    rejected_objects.sort(
-        key=lambda o: (utf8_key(o["uri"] or ""), compact_json(o))
-    )
-
-    lineage.sort(key=lambda o: (utf8_key(o["uri"]), compact_json(o)))
-
+    
     response = {
-        "splits": out_splits,
-        "rejectedObjects": rejected_objects,
-        "rejectedRows": rejected_rows_out,
-        "digests": digests,
-        "lineage": lineage,
+        "runId": run_id,
+        "selectedTrialId": best_trial["id"],
+        "trainRowIds": train_ids,
+        "evalRowIds": eval_ids,
+        "featureNames": valid_features,
+        "datasetDigest": sha256_compact(digest_payload),
+        "reasonCodes": []
     }
+    
+    _STATE[run_id] = {"request": payload, "response": response}
+    return response, None
 
-    logger.info(json.dumps({
-        "event": "summary",
-        "train_count": len(out_splits["train"]),
-        "validation_count": len(out_splits["validation"]),
-        "test_count": len(out_splits["test"]),
-        "rejected_objects_count": len(rejected_objects),
-        "rejected_rows_count": len(rejected_rows_out),
-    }))
+def handle_evaluate(payload: dict):
+    run_id = payload.get("runId")
+    trial_id = payload.get("selectedTrialId")
+    digest = payload.get("datasetDigest")
+    
+    if type(run_id) is not str or type(trial_id) is not int or type(digest) is not str:
+        return None, ["INVALID_INPUT"]
+        
+    codes = set()
+    test_metric = None
+    critical_pass = True
+    
+    # Lineage check
+    if run_id not in _STATE:
+        codes.add("INVALID_LINEAGE")
+        critical_pass = False
+    else:
+        saved = _STATE[run_id]["response"]
+        if saved["selectedTrialId"] != trial_id or saved["datasetDigest"] != digest:
+            codes.add("INVALID_LINEAGE")
+            critical_pass = False
 
-    if debug_mode:
-        response["_debug"] = debug
+    floor_agg = payload.get("metricFloor")
+    req_slices = payload.get("requiredSlices")
+    bp = payload.get("bytesProcessed")
+    mb = payload.get("maxBytes")
+    rows = payload.get("rows")
+    
+    if type(floor_agg) not in (float, int) or not (0 <= floor_agg <= 1): codes.add("INVALID_INPUT")
+    if type(req_slices) is not dict: codes.add("INVALID_INPUT")
+    if type(bp) is not int or bp < 0 or type(mb) is not int or mb < 0: codes.add("INVALID_INPUT")
+    if type(rows) is not list: codes.add("INVALID_INPUT")
 
-    return JSONResponse(response)
+    if "INVALID_INPUT" in codes:
+        critical_pass = False
+        return None, list(codes), critical_pass
 
+    # Byte check
+    if bp > mb:
+        codes.add("BYTE_LIMIT")
 
-@app.get("/")
-async def root():
-    return {"status": "ok", "endpoint": "POST /build-corpus"}
+    valid_rows = True
+    if not rows:
+        valid_rows = False
+        critical_pass = False
+        
+    slice_stats = {}
+    total_correct = 0
+    total_rows = 0
+    
+    for r in rows:
+        if type(r) is not dict:
+            codes.add("INVALID_TEST_ROW")
+            valid_rows = False
+            continue
+            
+        lbl = r.get("label")
+        prd = r.get("prediction")
+        slc = r.get("slice")
+        
+        if lbl not in (0, 1) or prd not in (0, 1) or type(slc) is not str or not slc:
+            codes.add("INVALID_TEST_ROW")
+            valid_rows = False
+            continue
+            
+        total_rows += 1
+        is_correct = (lbl == prd)
+        if is_correct: total_correct += 1
+        
+        if slc not in slice_stats: slice_stats[slc] = {"c": 0, "t": 0}
+        slice_stats[slc]["t"] += 1
+        if is_correct: slice_stats[slc]["c"] += 1
+
+    if not valid_rows:
+        critical_pass = False
+    else:
+        # Aggregates
+        test_metric = round(total_correct / total_rows, 12)
+        if test_metric < floor_agg:
+            codes.add("AGGREGATE_FLOOR")
+            
+        for req_slice, s_floor in req_slices.items():
+            if type(s_floor) not in (float, int) or not (0 <= s_floor <= 1):
+                codes.add("INVALID_INPUT")
+                critical_pass = False
+                continue
+                
+            if req_slice not in slice_stats:
+                codes.add(f"MISSING_SLICE:{req_slice}")
+                critical_pass = False
+            else:
+                s_acc = round(slice_stats[req_slice]["c"] / slice_stats[req_slice]["t"], 12)
+                if s_acc < s_floor:
+                    codes.add(f"SLICE_FLOOR:{req_slice}")
+                    critical_pass = False
+
+    decision = "admit" if (not codes and test_metric is not None and critical_pass) else "reject"
+    
+    # Enforce formatting constraints
+    if codes:
+        codes_list = sorted(list(codes), key=lambda x: x.encode('utf-8'))
+    else:
+        codes_list = []
+        
+    response = {
+        "runId": run_id,
+        "selectedTrialId": trial_id,
+        "datasetDigest": digest,
+        "testMetric": test_metric,
+        "criticalSlicePass": critical_pass,
+        "decision": decision,
+        "bytesProcessed": bp,
+        "reasonCodes": codes_list
+    }
+    
+    return response, None, None
+
+@app.post("/bqml")
+async def bqml_endpoint(request: Request):
+    try:
+        body_bytes = await request.body()
+        payload = json.loads(body_bytes)
+    except Exception:
+        return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
+        
+    if type(payload) is not dict:
+        return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
+
+    phase = payload.get("phase")
+    
+    if phase == "select":
+        res, errs = handle_select(payload)
+        if errs:
+            if errs[0] == "CONFLICT":
+                return Response(content=json.dumps({"error": "RUN_ID_CONFLICT"}), status_code=409, media_type="application/json")
+            
+            # Error shaping
+            err_res = {
+                "runId": payload.get("runId") if type(payload.get("runId")) is str else "",
+                "selectedTrialId": None,
+                "trainRowIds": [],
+                "evalRowIds": [],
+                "featureNames": [],
+                "datasetDigest": None,
+                "reasonCodes": sorted(errs, key=lambda x: x.encode('utf-8'))
+            }
+            return Response(content=json.dumps(err_res), status_code=200, media_type="application/json")
+            
+        return Response(content=json.dumps(res), status_code=200, media_type="application/json")
+
+    elif phase == "evaluate":
+        res, errs, _ = handle_evaluate(payload)
+        if errs and res is None:
+            # Fatal input error mapping
+            err_res = {
+                "runId": payload.get("runId") if type(payload.get("runId")) is str else "",
+                "selectedTrialId": payload.get("selectedTrialId") if type(payload.get("selectedTrialId")) is int else 0,
+                "datasetDigest": payload.get("datasetDigest") if type(payload.get("datasetDigest")) is str else "",
+                "testMetric": None,
+                "criticalSlicePass": False,
+                "decision": "reject",
+                "bytesProcessed": payload.get("bytesProcessed") if type(payload.get("bytesProcessed")) is int else 0,
+                "reasonCodes": sorted(errs, key=lambda x: x.encode('utf-8'))
+            }
+            return Response(content=json.dumps(err_res), status_code=200, media_type="application/json")
+            
+        return Response(content=json.dumps(res), status_code=200, media_type="application/json")
+        
+    else:
+        return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
