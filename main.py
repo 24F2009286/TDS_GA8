@@ -35,6 +35,15 @@ def parse_and_validate_time(ts: str):
 def _reject_constant(_s):
     raise ValueError("non-JSON constant")
 
+def is_safe_int(v, non_negative=False):
+    if type(v) is not int: return False
+    if non_negative and v < 0: return False
+    return -9007199254740991 <= v <= 9007199254740991
+
+def sha256_compact(data: dict) -> str:
+    compact_str = json.dumps(data, separators=(',', ':'), ensure_ascii=False)
+    return hashlib.sha256(compact_str.encode('utf-8')).hexdigest()
+
 
 # ==========================================
 # Q1: BUILD CORPUS LOGIC
@@ -138,7 +147,7 @@ async def build_corpus(request: Request):
                     if not all(type(row[k]) is str for k in ["id", "entity", "eventTime", "text"]):
                         has_schema_error = True; continue
                     rev = row["revision"]
-                    if type(rev) is not int or type(rev) is bool or rev < 0 or rev > 9007199254740991:
+                    if not is_safe_int(rev, non_negative=True):
                         has_schema_error = True; continue
                     
                     dt = parse_and_validate_time(row["eventTime"])
@@ -222,138 +231,134 @@ async def build_corpus(request: Request):
 # ==========================================
 _STATE = {}
 
-def sha256_compact(data: dict) -> str:
-    compact_str = json.dumps(data, separators=(',', ':'), ensure_ascii=False)
-    return hashlib.sha256(compact_str.encode('utf-8')).hexdigest()
-
 def handle_select(payload: dict):
-    run_id = payload.get("runId")
-    if type(run_id) is not str or not run_id or len(run_id) > 128: return None, ["INVALID_INPUT"]
+    run_id, limit, forbidden, rows, trials = payload.get("runId"), payload.get("numTrialsLimit"), payload.get("forbiddenFeatures"), payload.get("rows"), payload.get("trials")
     
-    if run_id in _STATE:
-        return (_STATE[run_id]["response"], None) if _STATE[run_id]["request"] == payload else ("CONFLICT", None)
-
-    limit = payload.get("numTrialsLimit")
-    if type(limit) is not int or limit <= 0: return None, ["INVALID_INPUT"]
-
-    rows, trials = payload.get("rows"), payload.get("trials")
-    if type(rows) is not list or not rows or type(trials) is not list: return None, ["INVALID_INPUT"]
-
-    groups = {}
-    for r in rows:
-        if type(r) is not dict: return None, ["INVALID_INPUT"]
-        r_id, ent, evt, pt, ver, split, feats = r.get("id"), r.get("entity"), r.get("eventTime"), r.get("predictionTime"), r.get("version"), r.get("split"), r.get("features")
+    invalid = False
+    if type(run_id) is not str or not run_id or len(run_id) > 128: invalid = True
+    if not is_safe_int(limit) or limit <= 0: invalid = True
+    if type(forbidden) is not list or not all(type(x) is str for x in forbidden): invalid = True
+    if type(rows) is not list or not rows or type(trials) is not list: invalid = True
+    
+    if invalid: return {"runId": run_id if type(run_id) is str else "", "selectedTrialId": None, "trainRowIds": [], "evalRowIds": [], "featureNames": [], "datasetDigest": None, "reasonCodes": ["INVALID_INPUT"]}
         
-        if not all(type(x) is str for x in [r_id, ent, evt, pt, split]) or type(ver) is not int or ver < 0 or split not in ("TRAIN", "EVAL") or type(feats) is not dict: return None, ["INVALID_INPUT"]
+    if run_id in _STATE: return _STATE[run_id]["response"] if _STATE[run_id]["request"] == payload else {"_conflict": True}
+            
+    row_ids, groups = set(), {}
+    for r in rows:
+        if type(r) is not dict: invalid = True; break
+        rid = r.get("id")
+        if type(rid) is not str or rid in row_ids: invalid = True; break
+        row_ids.add(rid)
+        
+        ent, evt, pt, ver, split, feats = r.get("entity"), r.get("eventTime"), r.get("predictionTime"), r.get("version"), r.get("split"), r.get("features")
+        if type(ent) is not str or type(evt) is not str or type(pt) is not str or type(split) is not str: invalid = True; break
+        if split not in ("TRAIN", "EVAL") or not is_safe_int(ver, non_negative=True) or type(feats) is not dict: invalid = True; break
         
         evt_dt, pt_dt = parse_and_validate_time(evt), parse_and_validate_time(pt)
-        if not evt_dt or not pt_dt: return None, ["INVALID_INPUT"]
+        if not evt_dt or not pt_dt: invalid = True; break
         
-        r.update({"_evt_dt": evt_dt, "_pt_dt": pt_dt, "_id_bytes": r_id.encode('utf-8')})
-        key = (ent, evt_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+        for fn, fv in feats.items():
+            if type(fn) is not str or type(fv) is not dict or "value" not in fv: invalid = True; break
+            avail = fv.get("availableAt")
+            if type(avail) is not str or not parse_and_validate_time(avail): invalid = True; break
+            
+        if invalid: break
+        
+        r.update({"_evt_dt": evt_dt, "_pt_dt": pt_dt, "_id_bytes": rid.encode('utf-8')})
+        key = (ent, evt_dt.timestamp())
         if key not in groups: groups[key] = []
         groups[key].append(r)
-
+        
+    if invalid: return {"runId": run_id, "selectedTrialId": None, "trainRowIds": [], "evalRowIds": [], "featureNames": [], "datasetDigest": None, "reasonCodes": ["INVALID_INPUT"]}
+        
     retained = [sorted(members, key=lambda x: (-x["version"], x["_id_bytes"]))[0] for members in groups.values()]
-    if not retained: return None, ["INVALID_INPUT"]
-
-    forbidden = set(payload.get("forbiddenFeatures", []))
-    feature_counts, feature_valid = {}, {}
-    
+        
+    f_counts, f_valid = {}, {}
     for r in retained:
-        for fname, fval in r["features"].items():
-            if fname in forbidden: continue
-            if type(fval) is not dict: return None, ["INVALID_INPUT"]
-            avail_dt = parse_and_validate_time(fval.get("availableAt", ""))
-            if not avail_dt: return None, ["INVALID_INPUT"]
+        for fn, fv in r["features"].items():
+            if fn in forbidden: continue
+            avail_dt = parse_and_validate_time(fv["availableAt"])
+            f_counts[fn] = f_counts.get(fn, 0) + 1
+            if fn not in f_valid: f_valid[fn] = True
+            if avail_dt > r["_pt_dt"]: f_valid[fn] = False
             
-            feature_counts[fname] = feature_counts.get(fname, 0) + 1
-            if fname not in feature_valid: feature_valid[fname] = True
-            if avail_dt > r["_pt_dt"]: feature_valid[fname] = False
-
-    valid_features = sorted([fname for fname, count in feature_counts.items() if count == len(retained) and feature_valid[fname]], key=lambda x: x.encode('utf-8'))
-
-    if len(trials) > limit: return None, ["TRIAL_LIMIT_EXCEEDED"]
-        
-    best_trial = None
+    v_feats = sorted([fn for fn, count in f_counts.items() if count == len(retained) and f_valid[fn]], key=lambda x: x.encode('utf-8'))
+    t_ids = sorted([r["id"] for r in retained if r["split"] == "TRAIN"], key=lambda x: x.encode('utf-8'))
+    e_ids = sorted([r["id"] for r in retained if r["split"] == "EVAL"], key=lambda x: x.encode('utf-8'))
+    digest = sha256_compact({"trainRowIds": t_ids, "evalRowIds": e_ids, "featureNames": v_feats})
+    
+    trial_ids, best_trial = set(), None
     for t in trials:
-        if type(t) is not dict: return None, ["INVALID_INPUT"]
-        t_id, status, metric = t.get("trialId"), t.get("status"), t.get("evalMetric")
+        if type(t) is not dict: invalid = True; break
+        tid, status, metric = t.get("trialId"), t.get("status"), t.get("evalMetric")
+        if not is_safe_int(tid, non_negative=True) or tid in trial_ids or status not in ("SUCCEEDED", "FAILED"): invalid = True; break
+        trial_ids.add(tid)
         
-        if type(t_id) is not int or t_id < 0 or status not in ("SUCCEEDED", "FAILED") or type(metric) not in (float, int) or not math.isfinite(metric): return None, ["INVALID_INPUT"]
+        if "evalMetric" in t:
+            if type(metric) not in (float, int) or not math.isfinite(metric): invalid = True; break
+        elif status == "SUCCEEDED": invalid = True; break
+            
+        if status == "SUCCEEDED" and (best_trial is None or metric > best_trial["metric"] or (metric == best_trial["metric"] and tid < best_trial["id"])):
+            best_trial = {"id": tid, "metric": metric}
+                
+    if invalid: return {"runId": run_id, "selectedTrialId": None, "trainRowIds": [], "evalRowIds": [], "featureNames": [], "datasetDigest": None, "reasonCodes": ["INVALID_INPUT"]}
         
-        if status == "SUCCEEDED":
-            if best_trial is None or metric > best_trial["metric"] or (metric == best_trial["metric"] and t_id < best_trial["id"]):
-                best_trial = {"id": t_id, "metric": metric}
-
-    if not best_trial: return None, ["NO_SUCCESSFUL_TRIAL"]
-
-    train_ids = sorted([r["id"] for r in retained if r["split"] == "TRAIN"], key=lambda x: x.encode('utf-8'))
-    eval_ids = sorted([r["id"] for r in retained if r["split"] == "EVAL"], key=lambda x: x.encode('utf-8'))
-    
-    response = {
-        "runId": run_id, "selectedTrialId": best_trial["id"], "trainRowIds": train_ids,
-        "evalRowIds": eval_ids, "featureNames": valid_features,
-        "datasetDigest": sha256_compact({"trainRowIds": train_ids, "evalRowIds": eval_ids, "featureNames": valid_features}),
-        "reasonCodes": []
+    codes = []
+    if len(trials) > limit: codes.append("TRIAL_LIMIT_EXCEEDED")
+    elif not best_trial: codes.append("NO_SUCCESSFUL_TRIAL")
+        
+    res = {
+        "runId": run_id, "selectedTrialId": best_trial["id"] if not codes else None,
+        "trainRowIds": t_ids, "evalRowIds": e_ids, "featureNames": v_feats,
+        "datasetDigest": digest, "reasonCodes": codes
     }
-    
-    _STATE[run_id] = {"request": payload, "response": response}
-    return response, None
+    if not codes: _STATE[run_id] = {"request": payload, "response": res}
+    return res
 
 def handle_evaluate(payload: dict):
     run_id, trial_id, digest = payload.get("runId"), payload.get("selectedTrialId"), payload.get("datasetDigest")
-    if type(run_id) is not str or type(trial_id) is not int or type(digest) is not str: return None, ["INVALID_INPUT"], False
-        
-    codes, test_metric, critical_pass = set(), None, True
-    
-    if run_id not in _STATE or _STATE[run_id]["response"]["selectedTrialId"] != trial_id or _STATE[run_id]["response"]["datasetDigest"] != digest:
-        codes.add("INVALID_LINEAGE"); critical_pass = False
-
     floor_agg, req_slices, bp, mb, rows = payload.get("metricFloor"), payload.get("requiredSlices"), payload.get("bytesProcessed"), payload.get("maxBytes"), payload.get("rows")
     
-    if type(floor_agg) not in (float, int) or not (0 <= floor_agg <= 1) or type(req_slices) is not dict or type(bp) is not int or bp < 0 or type(mb) is not int or mb < 0 or type(rows) is not list:
-        codes.add("INVALID_INPUT")
-
-    if "INVALID_INPUT" in codes: return None, list(codes), False
+    invalid = False
+    if type(run_id) is not str or type(trial_id) is not int or type(digest) is not str: invalid = True
+    if type(floor_agg) not in (float, int) or not (0 <= floor_agg <= 1): invalid = True
+    if type(req_slices) is not dict or not all(type(v) in (float, int) and 0 <= v <= 1 for v in req_slices.values()): invalid = True
+    if not is_safe_int(bp, non_negative=True) or not is_safe_int(mb, non_negative=True) or type(rows) is not list: invalid = True
+    
+    if invalid: return {"runId": run_id if type(run_id) is str else "", "selectedTrialId": trial_id if type(trial_id) is int else 0, "datasetDigest": digest if type(digest) is str else "", "testMetric": None, "criticalSlicePass": False, "decision": "reject", "bytesProcessed": bp if type(bp) is int else 0, "reasonCodes": ["INVALID_INPUT"]}
+        
+    codes, critical = set(), True
+    if run_id not in _STATE or _STATE[run_id]["response"]["selectedTrialId"] != trial_id or _STATE[run_id]["response"]["datasetDigest"] != digest:
+        codes.add("INVALID_LINEAGE"); critical = False
+        
     if bp > mb: codes.add("BYTE_LIMIT")
-
-    valid_rows, slice_stats, total_correct, total_rows = True, {}, 0, 0
-    if not rows: valid_rows, critical_pass = False, False
+    
+    valid_rows, stats, c_tot, t_tot = True, {}, 0, 0
+    if not rows: valid_rows, critical = False, False
         
     for r in rows:
         if type(r) is not dict: codes.add("INVALID_TEST_ROW"); valid_rows = False; continue
         lbl, prd, slc = r.get("label"), r.get("prediction"), r.get("slice")
-        if lbl not in (0, 1) or prd not in (0, 1) or type(slc) is not str or not slc:
-            codes.add("INVALID_TEST_ROW"); valid_rows = False; continue
+        if type(lbl) is not int or lbl not in (0, 1) or type(prd) is not int or prd not in (0, 1) or type(slc) is not str or not slc: codes.add("INVALID_TEST_ROW"); valid_rows = False; continue
             
-        total_rows += 1
-        is_correct = (lbl == prd)
-        if is_correct: total_correct += 1
+        t_tot += 1
+        if lbl == prd: c_tot += 1
+        if slc not in stats: stats[slc] = {"c": 0, "t": 0}
+        stats[slc]["t"] += 1
+        if lbl == prd: stats[slc]["c"] += 1
         
-        if slc not in slice_stats: slice_stats[slc] = {"c": 0, "t": 0}
-        slice_stats[slc]["t"] += 1
-        if is_correct: slice_stats[slc]["c"] += 1
-
-    if not valid_rows:
-        critical_pass = False
+    tm = None
+    if not valid_rows: critical = False
     else:
-        test_metric = round(total_correct / total_rows, 12)
-        if test_metric < floor_agg: codes.add("AGGREGATE_FLOOR")
-            
-        for req_slice, s_floor in req_slices.items():
-            if type(s_floor) not in (float, int) or not (0 <= s_floor <= 1):
-                codes.add("INVALID_INPUT"); critical_pass = False; continue
-            if req_slice not in slice_stats:
-                codes.add(f"MISSING_SLICE:{req_slice}"); critical_pass = False
-            elif round(slice_stats[req_slice]["c"] / slice_stats[req_slice]["t"], 12) < s_floor:
-                codes.add(f"SLICE_FLOOR:{req_slice}"); critical_pass = False
-
-    return {
-        "runId": run_id, "selectedTrialId": trial_id, "datasetDigest": digest, "testMetric": test_metric,
-        "criticalSlicePass": critical_pass, "decision": "admit" if (not codes and test_metric is not None and critical_pass) else "reject",
-        "bytesProcessed": bp, "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8')) if codes else []
-    }, None, None
+        tm = round(c_tot / t_tot, 12)
+        if tm < floor_agg: codes.add("AGGREGATE_FLOOR")
+        for rs, rsf in req_slices.items():
+            if rs not in stats: codes.add(f"MISSING_SLICE:{rs}"); critical = False
+            elif round(stats[rs]["c"] / stats[rs]["t"], 12) < rsf: codes.add(f"SLICE_FLOOR:{rs}"); critical = False
+                
+    dec = "admit" if not codes and tm is not None and critical else "reject"
+    return {"runId": run_id, "selectedTrialId": trial_id, "datasetDigest": digest, "testMetric": tm, "criticalSlicePass": critical, "decision": dec, "bytesProcessed": bp, "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))}
 
 @app.post("/bqml")
 async def bqml_endpoint(request: Request):
@@ -364,26 +369,10 @@ async def bqml_endpoint(request: Request):
 
     phase = payload.get("phase")
     if phase == "select":
-        res, errs = handle_select(payload)
-        if errs:
-            if errs[0] == "CONFLICT": return Response(content=json.dumps({"error": "RUN_ID_CONFLICT"}), status_code=409, media_type="application/json")
-            return Response(content=json.dumps({
-                "runId": payload.get("runId") if type(payload.get("runId")) is str else "", "selectedTrialId": None,
-                "trainRowIds": [], "evalRowIds": [], "featureNames": [], "datasetDigest": None, "reasonCodes": sorted(errs, key=lambda x: x.encode('utf-8'))
-            }), status_code=200, media_type="application/json")
-        return Response(content=json.dumps(res), status_code=200, media_type="application/json")
-
+        res = handle_select(payload)
+        if res.get("_conflict"): return Response(content=json.dumps({"error": "RUN_ID_CONFLICT"}), status_code=409, media_type="application/json")
+        return Response(content=json.dumps(res, ensure_ascii=False, separators=(',', ':')), status_code=200, media_type="application/json")
     elif phase == "evaluate":
-        res, errs, _ = handle_evaluate(payload)
-        if errs and res is None:
-            return Response(content=json.dumps({
-                "runId": payload.get("runId") if type(payload.get("runId")) is str else "",
-                "selectedTrialId": payload.get("selectedTrialId") if type(payload.get("selectedTrialId")) is int else 0,
-                "datasetDigest": payload.get("datasetDigest") if type(payload.get("datasetDigest")) is str else "",
-                "testMetric": None, "criticalSlicePass": False, "decision": "reject",
-                "bytesProcessed": payload.get("bytesProcessed") if type(payload.get("bytesProcessed")) is int else 0,
-                "reasonCodes": sorted(errs, key=lambda x: x.encode('utf-8'))
-            }), status_code=200, media_type="application/json")
-        return Response(content=json.dumps(res), status_code=200, media_type="application/json")
+        return Response(content=json.dumps(handle_evaluate(payload), ensure_ascii=False, separators=(',', ':')), status_code=200, media_type="application/json")
     else:
         return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
