@@ -609,3 +609,314 @@ async def promote_endpoint(request: Request):
     }
 
     return Response(content=json.dumps(res, ensure_ascii=False, separators=(',', ':')), status_code=200, media_type="application/json")
+
+# ==========================================
+# Q4: PEFT ADAPTATION & REPAIR
+# ==========================================
+def is_safe_int(v, non_negative=False, positive=False):
+    if type(v) is not int: return False
+    if non_negative and v < 0: return False
+    if positive and v <= 0: return False
+    return -9007199254740991 <= v <= 9007199254740991
+
+def handle_choose(payload: dict):
+    policy = payload.get("policy")
+    candidates = payload.get("candidates")
+    
+    # 400 Bad Request baseline
+    if type(policy) is not dict or type(candidates) is not list:
+        return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
+        
+    p_min_q = policy.get("minQuality")
+    p_fresh = policy.get("freshnessRequired")
+    p_lat = policy.get("maxLatencyMs")
+    p_mem = policy.get("maxMemoryMb")
+    p_data = policy.get("maxLabeledExamples")
+    p_cost = policy.get("maxTotalCost")
+    p_reqs = policy.get("horizonRequests")
+    
+    p_invalid = False
+    if type(p_min_q) not in (float, int) or not (0 <= p_min_q <= 1) or not math.isfinite(p_min_q): p_invalid = True
+    if type(p_fresh) is not bool: p_invalid = True
+    if type(p_lat) not in (float, int) or p_lat < 0 or not math.isfinite(p_lat): p_invalid = True
+    if type(p_mem) not in (float, int) or p_mem < 0 or not math.isfinite(p_mem): p_invalid = True
+    if not is_safe_int(p_data, non_negative=True) or not is_safe_int(p_reqs, non_negative=True): p_invalid = True
+    if type(p_cost) not in (float, int) or p_cost < 0 or not math.isfinite(p_cost): p_invalid = True
+
+    req_names = ["prompt_only", "retrieval", "lora", "qlora"]
+    c_map = {}
+    for c in candidates:
+        if type(c) is dict and type(c.get("name")) is str:
+            c_map[c["name"]] = c
+
+    if len(c_map) != 4 or not all(n in c_map for n in req_names):
+        return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
+
+    total_costs = {}
+    reason_codes = {n: [] for n in req_names}
+    eligible = []
+
+    for name in req_names:
+        c = c_map[name]
+        codes = set()
+        
+        if p_invalid:
+            codes.add("INVALID_INPUT")
+            
+        c_avail = c.get("available")
+        c_q = c.get("quality")
+        c_fresh = c.get("freshness")
+        c_lat = c.get("latencyMs")
+        c_mem = c.get("memoryMb")
+        c_data = c.get("labeledExamples")
+        c_otc = c.get("oneTimeCost")
+        c_rec = c.get("recurringCost")
+        
+        c_invalid = False
+        if type(c_avail) is not bool: c_invalid = True
+        if type(c_fresh) is not bool: c_invalid = True
+        if type(c_q) not in (float, int) or not (0 <= c_q <= 1) or not math.isfinite(c_q): c_invalid = True
+        if type(c_lat) not in (float, int) or c_lat < 0 or not math.isfinite(c_lat): c_invalid = True
+        if type(c_mem) not in (float, int) or c_mem < 0 or not math.isfinite(c_mem): c_invalid = True
+        if not is_safe_int(c_data, non_negative=True): c_invalid = True
+        if type(c_otc) not in (float, int) or c_otc < 0 or not math.isfinite(c_otc): c_invalid = True
+        if type(c_rec) not in (float, int) or c_rec < 0 or not math.isfinite(c_rec): c_invalid = True
+        
+        t_cost = 0.0
+        if c_invalid:
+            codes.add("INVALID_INPUT")
+        else:
+            if not c_avail: codes.add("UNAVAILABLE")
+            if c_q < p_min_q: codes.add("QUALITY_FLOOR")
+            if p_fresh and not c_fresh: codes.add("FRESHNESS_REQUIRED")
+            if c_lat > p_lat: codes.add("LATENCY_LIMIT")
+            if c_mem > p_mem: codes.add("MEMORY_LIMIT")
+            if c_data > p_data: codes.add("DATA_LIMIT")
+            
+            t_cost = round(c_otc + p_reqs * c_rec, 12)
+            if t_cost > p_cost: codes.add("COST_LIMIT")
+            
+        total_costs[name] = t_cost
+        
+        if codes:
+            reason_codes[name] = sorted(list(codes), key=lambda x: x.encode('utf-8'))
+        else:
+            eligible.append(name)
+
+    selected = eligible[0] if eligible else None
+
+    return Response(content=json.dumps({
+        "selected": selected,
+        "eligible": eligible,
+        "totalCosts": total_costs,
+        "reasonCodes": reason_codes
+    }, ensure_ascii=False, separators=(',', ':')), status_code=200, media_type="application/json")
+
+
+def handle_repair(payload: dict):
+    codes = set()
+    
+    # 1. Tokens and Labels
+    tokens = payload.get("tokens")
+    labels = []
+    tokens_invalid = False
+    if type(tokens) is not list or not tokens:
+        tokens_invalid = True
+        codes.add("INVALID_TOKEN")
+    else:
+        for t in tokens:
+            if type(t) is not dict: tokens_invalid = True; break
+            t_id = t.get("id")
+            role = t.get("role")
+            pad = t.get("padding")
+            txt = t.get("text")
+            
+            if not is_safe_int(t_id, non_negative=True): tokens_invalid = True
+            if role not in ("system", "user", "assistant"): tokens_invalid = True
+            if type(pad) is not bool: tokens_invalid = True
+            if type(txt) is not str: tokens_invalid = True
+            
+        if tokens_invalid:
+            codes.add("INVALID_TOKEN")
+            if type(tokens) is list: labels = [-100] * len(tokens)
+        else:
+            for t in tokens:
+                if t["role"] == "assistant" and not t["padding"]:
+                    labels.append(t["id"])
+                else:
+                    labels.append(-100)
+                    
+    # 2. Template
+    t_apps = payload.get("templateApplications")
+    template_pass = True
+    if t_apps != 1:
+        template_pass = False
+        codes.add("CHAT_TEMPLATE_COUNT")
+        
+    # 3. Parameters & PEFT Config
+    params = payload.get("parameters")
+    allowed = payload.get("allowedTargets")
+    inf_mode = payload.get("inferenceMode")
+    peft_pass = True
+    trainable_names = []
+    trainable_sum = 0
+    
+    if type(inf_mode) is not bool or inf_mode:
+        peft_pass = False
+        codes.add("INFERENCE_MODE")
+        
+    if type(allowed) is not list or not allowed or not all(type(x) is str for x in allowed) or len(set(allowed)) != len(allowed):
+        peft_pass = False
+        codes.add("INVALID_PARAMETER")
+    elif type(params) is not list:
+        peft_pass = False
+        codes.add("INVALID_PARAMETER")
+    else:
+        p_names = set()
+        p_invalid = False
+        allowed_set = set(allowed)
+        has_trainable = False
+        
+        for p in params:
+            if type(p) is not dict: p_invalid = True; break
+            p_n, p_t, p_num = p.get("name"), p.get("target"), p.get("numel")
+            if type(p_n) is not str or p_n in p_names: p_invalid = True; break
+            p_names.add(p_n)
+            if type(p_t) is not str: p_invalid = True; break
+            if not is_safe_int(p_num, positive=True): p_invalid = True; break
+            
+            if p_t in allowed_set and (p_n.endswith(".lora_A.weight") or p_n.endswith(".lora_B.weight")):
+                has_trainable = True
+                trainable_names.append(p_n)
+                trainable_sum += p_num
+                
+        if p_invalid or not has_trainable:
+            peft_pass = False
+            codes.add("INVALID_PARAMETER")
+            trainable_names = []
+            trainable_sum = 0
+            
+    trainable_names.sort(key=lambda x: x.encode('utf-8'))
+    
+    # 4. Artifacts
+    artifacts = payload.get("artifactFiles")
+    adapter_files = []
+    if type(artifacts) is not list or not all(type(x) is str for x in artifacts):
+        codes.add("ADAPTER_FILE_SET")
+    else:
+        expected_art = {"adapter_config.json", "adapter_model.safetensors"}
+        actual_art = set(artifacts)
+        if len(artifacts) != 2 or actual_art != expected_art:
+            codes.add("ADAPTER_FILE_SET")
+            
+        full_model_indicators = [".bin", "pytorch_model", "model.safetensors", ".pt", ".ckpt"]
+        for a in artifacts:
+            if a not in expected_art and any(ind in a for ind in full_model_indicators):
+                codes.add("FULL_MODEL_ARTIFACT")
+                break
+                
+        if type(artifacts) is list:
+            adapter_files = sorted([str(x) for x in set(artifacts) if str(x) in expected_art], key=lambda x: x.encode('utf-8'))
+            if not adapter_files: adapter_files = sorted([str(x) for x in artifacts], key=lambda x: x.encode('utf-8'))
+
+    # 5. Lineage and Evaluation
+    b_rev = payload.get("baseRevision")
+    d_dig = payload.get("datasetDigest")
+    c_dig = payload.get("codeDigest")
+    cfg_dig = payload.get("configDigest")
+    exp_dig = payload.get("expectedDigests")
+    lineage_pass = True
+    
+    if type(b_rev) is not str or not re.fullmatch(r'^[0-9a-f]{40}$', b_rev):
+        lineage_pass = False
+        codes.add("MUTABLE_BASE_REVISION")
+        
+    if type(exp_dig) is not dict:
+        lineage_pass = False
+        codes.add("LINEAGE_MISMATCH")
+    else:
+        for dig, nm in [(d_dig, "datasetDigest"), (c_dig, "codeDigest"), (cfg_dig, "configDigest")]:
+            if type(dig) is not str or not re.fullmatch(r'^[0-9a-f]{64}$', dig) or dig != exp_dig.get(nm):
+                lineage_pass = False
+                codes.add("LINEAGE_MISMATCH")
+                
+    t_ids, e_ids = payload.get("trainRowIds"), payload.get("evalRowIds")
+    eval_iso = True
+    if type(t_ids) is not list or not t_ids or not all(type(x) is str for x in t_ids) or len(set(t_ids)) != len(t_ids):
+        eval_iso = False
+    elif type(e_ids) is not list or not e_ids or not all(type(x) is str for x in e_ids) or len(set(e_ids)) != len(e_ids):
+        eval_iso = False
+    elif set(t_ids).intersection(set(e_ids)):
+        eval_iso = False
+        
+    if not eval_iso: codes.add("EVAL_LEAKAGE")
+    
+    drop = payload.get("dropoutActiveDuringEval")
+    eval_det = True
+    if type(drop) is not bool or drop:
+        eval_det = False
+        codes.add("EVAL_DROPOUT_ACTIVE")
+        
+    # 6. Checkpoint and Batch Math
+    mb, ga, rp, eeb = payload.get("microBatch"), payload.get("gradientAccumulation"), payload.get("replicas"), payload.get("expectedEffectiveBatch")
+    if not is_safe_int(mb, positive=True) or not is_safe_int(ga, positive=True) or not is_safe_int(rp, positive=True) or not is_safe_int(eeb, positive=True):
+        codes.add("EFFECTIVE_BATCH_MISMATCH")
+    elif mb * ga * rp != eeb:
+        codes.add("EFFECTIVE_BATCH_MISMATCH")
+        
+    ckpt = payload.get("checkpoint")
+    ckpt_pass = True
+    if type(ckpt) is not dict:
+        ckpt_pass = False
+        codes.add("INCOMPLETE_CHECKPOINT")
+    else:
+        req_keys = {"model", "optimizer", "scheduler", "step", "rng", "dataPosition"}
+        if not req_keys.issubset(set(ckpt.keys())):
+            ckpt_pass = False
+            codes.add("INCOMPLETE_CHECKPOINT")
+            
+    uw, rw, rtol = payload.get("uninterruptedWeights"), payload.get("resumedWeights"), payload.get("resumeTolerance")
+    resume_pass = True
+    if type(uw) is not list or not uw or not all(type(x) in (float, int) and math.isfinite(x) for x in uw): resume_pass = False
+    elif type(rw) is not list or not rw or not all(type(x) in (float, int) and math.isfinite(x) for x in rw): resume_pass = False
+    elif len(uw) != len(rw): resume_pass = False
+    elif type(rtol) not in (float, int) or rtol < 0 or not math.isfinite(rtol): resume_pass = False
+    else:
+        for u, r in zip(uw, rw):
+            if abs(u - r) > rtol:
+                resume_pass = False
+                break
+                
+    if not resume_pass: codes.add("RESUME_DIVERGENCE")
+
+    return Response(content=json.dumps({
+        "labels": labels,
+        "templatePass": template_pass,
+        "trainableParams": trainable_names,
+        "trainableCount": trainable_sum,
+        "peftConfigPass": peft_pass,
+        "adapterFiles": adapter_files,
+        "checkpointComplete": ckpt_pass,
+        "lineagePass": lineage_pass,
+        "evalIsolated": eval_iso,
+        "evaluationDeterministic": eval_det,
+        "resumePass": resume_pass,
+        "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))
+    }, ensure_ascii=False, separators=(',', ':')), status_code=200, media_type="application/json")
+
+
+@app.post("/adapt")
+@app.post("/adapt/")
+async def adapt_endpoint(request: Request):
+    try: payload = json.loads(await request.body())
+    except Exception: return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
+        
+    if type(payload) is not dict: return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
+
+    op = payload.get("operation")
+    if op == "choose":
+        return handle_choose(payload)
+    elif op == "repair":
+        return handle_repair(payload)
+    else:
+        return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
