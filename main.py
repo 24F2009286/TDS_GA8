@@ -726,15 +726,11 @@ def handle_repair(payload: dict):
     else:
         for t in tokens:
             if type(t) is not dict: tokens_invalid = True; break
-            t_id = t.get("id")
-            role = t.get("role")
-            pad = t.get("padding")
-            txt = t.get("text")
+            t_id, role, pad, txt = t.get("id"), t.get("role"), t.get("padding"), t.get("text")
             
             if not is_safe_int(t_id, non_negative=True): tokens_invalid = True
             if role not in ("system", "user", "assistant"): tokens_invalid = True
-            if type(pad) is not bool: tokens_invalid = True
-            if type(txt) is not str: tokens_invalid = True
+            if type(pad) is not bool or type(txt) is not str: tokens_invalid = True
             
         if tokens_invalid:
             codes.add("INVALID_TOKEN")
@@ -765,7 +761,8 @@ def handle_repair(payload: dict):
         peft_pass = False
         codes.add("INFERENCE_MODE")
         
-    if type(allowed) is not list or not allowed or not all(type(x) is str for x in allowed) or len(set(allowed)) != len(allowed):
+    # Ensure allowedTargets are strings and NON-EMPTY
+    if type(allowed) is not list or not allowed or not all(type(x) is str and x for x in allowed) or len(set(allowed)) != len(allowed):
         peft_pass = False
         codes.add("INVALID_PARAMETER")
     elif type(params) is not list:
@@ -780,8 +777,10 @@ def handle_repair(payload: dict):
         for p in params:
             if type(p) is not dict: p_invalid = True; break
             p_n, p_t, p_num = p.get("name"), p.get("target"), p.get("numel")
+            
             if type(p_n) is not str or p_n in p_names: p_invalid = True; break
             p_names.add(p_n)
+            
             if type(p_t) is not str: p_invalid = True; break
             if not is_safe_int(p_num, positive=True): p_invalid = True; break
             
@@ -789,6 +788,9 @@ def handle_repair(payload: dict):
                 has_trainable = True
                 trainable_names.append(p_n)
                 trainable_sum += p_num
+                # Safely sum numel bounds check
+                if not is_safe_int(trainable_sum, non_negative=True):
+                    p_invalid = True
                 
         if p_invalid or not has_trainable:
             peft_pass = False
@@ -809,15 +811,12 @@ def handle_repair(payload: dict):
         if len(artifacts) != 2 or actual_art != expected_art:
             codes.add("ADAPTER_FILE_SET")
             
-        full_model_indicators = [".bin", "pytorch_model", "model.safetensors", ".pt", ".ckpt"]
-        for a in artifacts:
-            if a not in expected_art and any(ind in a for ind in full_model_indicators):
-                codes.add("FULL_MODEL_ARTIFACT")
-                break
-                
-        if type(artifacts) is list:
-            adapter_files = sorted([str(x) for x in set(artifacts) if str(x) in expected_art], key=lambda x: x.encode('utf-8'))
-            if not adapter_files: adapter_files = sorted([str(x) for x in artifacts], key=lambda x: x.encode('utf-8'))
+        # Exact match for full model files to avoid false positives on "adapter_model.safetensors"
+        full_model_names = {"pytorch_model.bin", "model.safetensors", "pytorch_model.pt", "consolidated.00.pth"}
+        if any(a in full_model_names for a in artifacts):
+            codes.add("FULL_MODEL_ARTIFACT")
+            
+        adapter_files = sorted(list(actual_art), key=lambda x: x.encode('utf-8'))
 
     # 5. Lineage and Evaluation
     b_rev = payload.get("baseRevision")
@@ -842,9 +841,11 @@ def handle_repair(payload: dict):
                 
     t_ids, e_ids = payload.get("trainRowIds"), payload.get("evalRowIds")
     eval_iso = True
-    if type(t_ids) is not list or not t_ids or not all(type(x) is str for x in t_ids) or len(set(t_ids)) != len(t_ids):
+    
+    # Ensure IDs are non-empty strings (using 'and x')
+    if type(t_ids) is not list or not t_ids or not all(type(x) is str and x for x in t_ids) or len(set(t_ids)) != len(t_ids):
         eval_iso = False
-    elif type(e_ids) is not list or not e_ids or not all(type(x) is str for x in e_ids) or len(set(e_ids)) != len(e_ids):
+    elif type(e_ids) is not list or not e_ids or not all(type(x) is str and x for x in e_ids) or len(set(e_ids)) != len(e_ids):
         eval_iso = False
     elif set(t_ids).intersection(set(e_ids)):
         eval_iso = False
@@ -903,7 +904,6 @@ def handle_repair(payload: dict):
         "resumePass": resume_pass,
         "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))
     }, ensure_ascii=False, separators=(',', ':')), status_code=200, media_type="application/json")
-
 
 @app.post("/adapt")
 @app.post("/adapt/")
