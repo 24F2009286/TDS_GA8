@@ -761,8 +761,7 @@ def handle_repair(payload: dict):
         peft_pass = False
         codes.add("INFERENCE_MODE")
         
-    # Ensure allowedTargets are strings and NON-EMPTY
-    if type(allowed) is not list or not allowed or not all(type(x) is str and x for x in allowed) or len(set(allowed)) != len(allowed):
+    if type(allowed) is not list or not all(type(x) is str and x for x in allowed) or len(set(allowed)) != len(allowed):
         peft_pass = False
         codes.add("INVALID_PARAMETER")
     elif type(params) is not list:
@@ -788,7 +787,8 @@ def handle_repair(payload: dict):
                 has_trainable = True
                 trainable_names.append(p_n)
                 trainable_sum += p_num
-                # Safely sum numel bounds check
+                
+                # Check for sum overflow strictly at every addition
                 if not is_safe_int(trainable_sum, non_negative=True):
                     p_invalid = True
                 
@@ -811,8 +811,8 @@ def handle_repair(payload: dict):
         if len(artifacts) != 2 or actual_art != expected_art:
             codes.add("ADAPTER_FILE_SET")
             
-        # Exact match for full model files to avoid false positives on "adapter_model.safetensors"
-        full_model_names = {"pytorch_model.bin", "model.safetensors", "pytorch_model.pt", "consolidated.00.pth"}
+        # Catch standard base-model components indicating a full artifact breach
+        full_model_names = {"pytorch_model.bin", "model.safetensors", "pytorch_model.pt", "consolidated.00.pth", "config.json"}
         if any(a in full_model_names for a in artifacts):
             codes.add("FULL_MODEL_ARTIFACT")
             
@@ -842,7 +842,6 @@ def handle_repair(payload: dict):
     t_ids, e_ids = payload.get("trainRowIds"), payload.get("evalRowIds")
     eval_iso = True
     
-    # Ensure IDs are non-empty strings (using 'and x')
     if type(t_ids) is not list or not t_ids or not all(type(x) is str and x for x in t_ids) or len(set(t_ids)) != len(t_ids):
         eval_iso = False
     elif type(e_ids) is not list or not e_ids or not all(type(x) is str and x for x in e_ids) or len(set(e_ids)) != len(e_ids):
@@ -904,7 +903,6 @@ def handle_repair(payload: dict):
         "resumePass": resume_pass,
         "reasonCodes": sorted(list(codes), key=lambda x: x.encode('utf-8'))
     }, ensure_ascii=False, separators=(',', ':')), status_code=200, media_type="application/json")
-
 @app.post("/adapt")
 @app.post("/adapt/")
 async def adapt_endpoint(request: Request):
