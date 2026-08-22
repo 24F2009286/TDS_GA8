@@ -440,12 +440,11 @@ async def promote_endpoint(request: Request):
     policy = payload.get("policy")
     versions = payload.get("versions")
     
-    # 400 Bad Request limits explicitly defined in the prompt
+    # HTTP 400 constraints explicitly defined in the prompt
     if type(policy) is not dict or type(versions) is not list or type(champ_v) is not str:
         return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
 
     as_of_dt = parse_and_validate_time(as_of_str)
-    if not as_of_dt: return Response(content=json.dumps({"error": "INVALID_INPUT"}), status_code=400, media_type="application/json")
 
     p_dataset = policy.get("datasetDigest")
     p_schema = policy.get("schemaDigest")
@@ -456,21 +455,21 @@ async def promote_endpoint(request: Request):
     p_size = policy.get("maxSizeBytes")
     p_imp = policy.get("minImprovement")
 
-    # Policy Validation
+    # Global Policy Validation
     p_invalid = False
     if type(p_dataset) is not str or not p_dataset or type(p_schema) is not str or not p_schema: p_invalid = True
-    if not is_safe_int(p_age, non_negative=True) or not is_safe_int(p_size, non_negative=True): p_invalid = True
+    if type(p_age) is not int or p_age < 0 or type(p_size) is not int or p_size < 0: p_invalid = True
     if type(p_acc) not in (float, int) or not (0 <= p_acc <= 1) or not math.isfinite(p_acc): p_invalid = True
     if type(p_lat) not in (float, int) or p_lat < 0 or not math.isfinite(p_lat): p_invalid = True
     if type(p_imp) not in (float, int) or not (0 <= p_imp <= 1) or not math.isfinite(p_imp): p_invalid = True
     if type(p_slices) is not dict or not all(type(v) in (float, int) and 0 <= v <= 1 and math.isfinite(v) for v in p_slices.values()): p_invalid = True
 
-    # Pre-scan for duplicates across all version types
+    # Pre-scan for duplicates across all input variants
     v_counts = {}
     for v_obj in versions:
         if type(v_obj) is dict:
             v_raw = v_obj.get("version")
-            v_key = str(v_raw) if type(v_raw) not in (dict, list) else json.dumps(v_raw)
+            v_key = v_raw if type(v_raw) is str else json.dumps(v_raw, separators=(',', ':'))
             v_counts[v_key] = v_counts.get(v_key, 0) + 1
 
     failed_gates = {}
@@ -481,84 +480,84 @@ async def promote_endpoint(request: Request):
         if type(v_obj) is not dict: continue
         
         v_raw = v_obj.get("version")
-        v_key = str(v_raw) if type(v_raw) not in (dict, list) else json.dumps(v_raw)
-        
+        v_key = v_raw if type(v_raw) is str else json.dumps(v_raw, separators=(',', ':'))
         codes = set()
         
         # 1. Identity Validation
-        if type(v_raw) is not str or not is_canonical_positive_safe_int(v_raw):
+        if not is_canonical_positive_safe_int(v_raw):
             codes.add("INVALID_VERSION")
-            
         if v_counts.get(v_key, 0) > 1:
             codes.add("DUPLICATE_VERSION")
             
-        # 2. Policy Integrity Check
+        # 2. Global Policy Check
         if p_invalid:
             codes.add("INVALID_POLICY")
 
-        # 3. Evidence Inspection
-        v_eval = v_obj.get("evaluation")
-        if type(v_eval) is not dict:
-            codes.add("MISSING_EVALUATION")
-        else:
-            e_ca = v_eval.get("createdAt")
-            e_art = v_eval.get("artifactDigest")
-            e_dat = v_eval.get("datasetDigest")
-            e_sch = v_eval.get("schemaDigest")
-            e_acc = v_eval.get("accuracy")
-            e_lat = v_eval.get("latencyMs")
-            e_size = v_eval.get("sizeBytes")
-            e_slices = v_eval.get("slices")
-
-            # Timestamps
-            e_dt = parse_and_validate_time(e_ca)
-            if not e_dt:
-                codes.add("INVALID_TIMESTAMP")
+        # 3. Evidence Inspection (Strict bypass for malformed/duplicate identities)
+        if "INVALID_VERSION" not in codes and "DUPLICATE_VERSION" not in codes:
+            v_eval = v_obj.get("evaluation")
+            if type(v_eval) is not dict:
+                codes.add("MISSING_EVALUATION")
             else:
-                if e_dt > as_of_dt: codes.add("FUTURE_EVALUATION")
-                elif type(p_age) is int and e_dt < (as_of_dt - timedelta(seconds=p_age)): codes.add("STALE_EVALUATION")
+                e_ca = v_eval.get("createdAt")
+                e_art = v_eval.get("artifactDigest")
+                e_dat = v_eval.get("datasetDigest")
+                e_sch = v_eval.get("schemaDigest")
+                e_acc = v_eval.get("accuracy")
+                e_lat = v_eval.get("latencyMs")
+                e_size = v_eval.get("sizeBytes")
+                e_slices = v_eval.get("slices")
 
-            # Artifact/Digests Mismatches
-            v_art = v_obj.get("artifactDigest")
-            if type(v_art) is not str or not v_art or v_art != e_art: codes.add("ARTIFACT_MISMATCH")
-            if type(p_dataset) is not str or not p_dataset or e_dat != p_dataset: codes.add("DATASET_MISMATCH")
-            if type(p_schema) is not str or not p_schema or e_sch != p_schema: codes.add("SCHEMA_MISMATCH")
+                # Timestamps
+                e_dt = parse_and_validate_time(e_ca)
+                if not e_dt or not as_of_dt:
+                    codes.add("INVALID_TIMESTAMP")
+                else:
+                    if e_dt > as_of_dt: codes.add("FUTURE_EVALUATION")
+                    elif type(p_age) is int and e_dt < (as_of_dt - timedelta(seconds=p_age)): codes.add("STALE_EVALUATION")
 
-            # Metrics Formats and Ranges
-            if type(e_acc) not in (float, int) or type(e_lat) not in (float, int) or not is_safe_int(e_size):
-                codes.add("NON_FINITE")
-            else:
-                if not math.isfinite(e_acc) or not math.isfinite(e_lat):
+                # Artifact/Digests Mismatches
+                v_art = v_obj.get("artifactDigest")
+                if type(v_art) is not str or not v_art or v_art != e_art: codes.add("ARTIFACT_MISMATCH")
+                if type(p_dataset) is not str or not p_dataset or e_dat != p_dataset: codes.add("DATASET_MISMATCH")
+                if type(p_schema) is not str or not p_schema or e_sch != p_schema: codes.add("SCHEMA_MISMATCH")
+
+                # Metric Formats and Ranges
+                if type(e_acc) not in (float, int) or not math.isfinite(e_acc):
                     codes.add("NON_FINITE")
-                else:
-                    if not (0 <= e_acc <= 1): codes.add("METRIC_RANGE")
-                    elif type(p_acc) in (float, int) and e_acc < p_acc: codes.add("ACCURACY_FLOOR")
-                    
-                    if e_lat < 0: codes.add("METRIC_RANGE")
-                    elif type(p_lat) in (float, int) and e_lat > p_lat: codes.add("LATENCY_LIMIT")
+                elif not (0 <= e_acc <= 1): codes.add("METRIC_RANGE")
+                elif type(p_acc) in (float, int) and e_acc < p_acc: codes.add("ACCURACY_FLOOR")
+                
+                if type(e_lat) not in (float, int) or not math.isfinite(e_lat):
+                    codes.add("NON_FINITE")
+                elif e_lat < 0: codes.add("METRIC_RANGE")
+                elif type(p_lat) in (float, int) and e_lat > p_lat: codes.add("LATENCY_LIMIT")
 
-                    if e_size < 0: codes.add("METRIC_RANGE")
-                    elif type(p_size) is int and e_size > p_size: codes.add("SIZE_LIMIT")
+                if type(e_size) is not int or not (-9007199254740991 <= e_size <= 9007199254740991):
+                    codes.add("NON_FINITE")
+                elif e_size < 0: codes.add("METRIC_RANGE")
+                elif type(p_size) is int and e_size > p_size: codes.add("SIZE_LIMIT")
 
-            # Slice Demographics
-            if type(p_slices) is dict:
-                if type(e_slices) is not dict:
-                    for req_slc in p_slices: codes.add(f"MISSING_SLICE:{req_slc}")
-                else:
-                    for req_slc, slc_floor in p_slices.items():
-                        if req_slc not in e_slices:
-                            codes.add(f"MISSING_SLICE:{req_slc}")
-                        else:
-                            slc_val = e_slices[req_slc]
-                            if type(slc_val) not in (float, int) or not math.isfinite(slc_val):
-                                codes.add(f"SLICE_RANGE:{req_slc}")
-                            elif not (0 <= slc_val <= 1):
-                                codes.add(f"SLICE_RANGE:{req_slc}")
-                            elif type(slc_floor) in (float, int) and slc_val < slc_floor:
-                                codes.add(f"SLICE_FLOOR:{req_slc}")
+                # Slice Demographics
+                if type(p_slices) is dict:
+                    if type(e_slices) is not dict:
+                        for req_slc in p_slices: codes.add(f"MISSING_SLICE:{req_slc}")
+                    else:
+                        for req_slc, slc_floor in p_slices.items():
+                            if req_slc not in e_slices:
+                                codes.add(f"MISSING_SLICE:{req_slc}")
+                            else:
+                                slc_val = e_slices[req_slc]
+                                if type(slc_val) not in (float, int) or not math.isfinite(slc_val):
+                                    codes.add(f"SLICE_RANGE:{req_slc}")
+                                elif not (0 <= slc_val <= 1):
+                                    codes.add(f"SLICE_RANGE:{req_slc}")
+                                elif type(slc_floor) in (float, int) and slc_val < slc_floor:
+                                    codes.add(f"SLICE_FLOOR:{req_slc}")
 
         if codes:
-            failed_gates[v_key] = sorted(list(codes), key=lambda x: x.encode('utf-8'))
+            if v_key not in failed_gates: failed_gates[v_key] = set()
+            failed_gates[v_key].update(codes)
         else:
             evidence_map[v_raw] = v_eval
             eligible_pool.append({
@@ -572,13 +571,14 @@ async def promote_endpoint(request: Request):
     # Ranking: Accuracy (desc), Latency (asc), Size (asc), Version Int (asc)
     eligible_pool.sort(key=lambda x: (-x["acc"], x["lat"], x["size"], x["v_int"]))
     eligible_versions = [x["v_str"] for x in eligible_pool]
+    fg_out = {k: sorted(list(v), key=lambda x: x.encode('utf-8')) for k, v in failed_gates.items()}
 
     action = "retain"
     selected = champ_v
     mutation = None
     final_evidence = None
 
-    # The champion must be an eligible survivor to avoid blocking the pipeline
+    # 4. Duel execution and output generation
     if champ_v in failed_gates or champ_v not in evidence_map:
         action = "block"
         selected = None
@@ -590,7 +590,6 @@ async def promote_endpoint(request: Request):
         
         diff = round(c_acc - champ_acc, 12)
         if type(p_imp) in (float, int) and diff >= p_imp:
-            # We cannot promote a champion to itself
             if c_str != champ_v:
                 action = "promote"
                 selected = c_str
@@ -604,7 +603,7 @@ async def promote_endpoint(request: Request):
         "championVersion": champ_v,
         "selectedVersion": selected,
         "eligibleVersions": eligible_versions,
-        "failedGates": failed_gates,
+        "failedGates": fg_out,
         "aliasMutation": mutation,
         "evidence": final_evidence
     }
