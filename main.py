@@ -808,13 +808,14 @@ def handle_repair(payload: dict):
     else:
         expected_art = {"adapter_config.json", "adapter_model.safetensors"}
         actual_art = set(artifacts)
-        if len(artifacts) != 2 or actual_art != expected_art:
-            codes.add("ADAPTER_FILE_SET")
-            
-        # Catch standard base-model components indicating a full artifact breach
+        
+        # Check for full model breach FIRST
         full_model_names = {"pytorch_model.bin", "model.safetensors", "pytorch_model.pt", "consolidated.00.pth", "config.json"}
         if any(a in full_model_names for a in artifacts):
             codes.add("FULL_MODEL_ARTIFACT")
+        # ONLY flag ADAPTER_FILE_SET if it isn't already a full model breach
+        elif len(artifacts) != 2 or actual_art != expected_art:
+            codes.add("ADAPTER_FILE_SET")
             
         adapter_files = sorted(list(actual_art), key=lambda x: x.encode('utf-8'))
 
